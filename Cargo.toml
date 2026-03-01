@@ -1,0 +1,20 @@
+[package]
+name        = "deshredder"
+version     = "0.1.0"
+edition     = "2024"
+description = "Pure Solana shred assembler library — zero I/O, zero async deps"
+license     = "MIT"
+
+[lib]
+name = "deshredder"
+path = "src/lib.rs"
+
+[dependencies]
+solana-ledger      = { git = "https://github.com/jito-foundation/jito-solana.git", rev = "cafa3ba4d4c6c3702d13545d9b434861ebc06036" }
+solana-entry       = { git = "https://github.com/jito-foundation/jito-solana.git", rev = "cafa3ba4d4c6c3702d13545d9b434861ebc06036" }
+solana-sdk         = "=2.2.1"
+solana-feature-set = "=2.2.1"
+bincode            = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
