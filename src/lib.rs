@@ -5,7 +5,6 @@ use assembler::SlotAssembler;
 use dedup::{Deduplicator, ShredKey};
 
 pub use solana_entry::entry::Entry;
-pub use solana_sdk::transaction::VersionedTransaction;
 
 /// A slot together with its assembled entries and the pre-encoded bytes.
 ///

@@ -1,11 +1,5 @@
 use solana_entry::entry::Entry;
-use solana_ledger::shred::{
-    shred_data::ShredData,
-    traits::ShredData as ShredDataTrait,
-    merkle,
-    ReedSolomonCache,
-    Shred,
-};
+use solana_ledger::shred::{ReedSolomonCache, Shred};
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,8 +48,8 @@ impl SlotBuffer {
 }
 
 pub(crate) struct SlotAssembler {
-    slots:            HashMap<u64, SlotBuffer>,
-    slot_timeout_ms:  u64,
+    slots:              HashMap<u64, SlotBuffer>,
+    slot_timeout_ms:    u64,
     reed_solomon_cache: ReedSolomonCache,
 }
 
@@ -102,12 +96,12 @@ impl SlotAssembler {
                     shred_data_bytes(shred).map(|b| b.to_vec())
                 };
                 match data {
-                    Ok(bytes) => {
+                    Some(bytes) => {
                         let buf = self.slots.get_mut(&slot).unwrap();
                         buf.prefix_bytes.extend_from_slice(&bytes);
                         buf.next_stream_index += 1;
                     }
-                    Err(_) => break 'extend,
+                    None => break 'extend,
                 }
             } else {
                 let fec_sets = self.unrecovered_fec_sets(slot);
@@ -212,7 +206,8 @@ impl SlotAssembler {
             None    => return,
         };
 
-        let all: Vec<merkle::Shred> = buf
+        // Collect both data and coding shreds for this FEC set.
+        let all: Vec<Shred> = buf
             .data_shreds
             .values()
             .filter(|s| s.fec_set_index() == fec_set_index)
@@ -221,19 +216,19 @@ impl SlotAssembler {
                     .values()
                     .filter(|s| s.fec_set_index() == fec_set_index),
             )
-            .filter_map(|s| merkle::Shred::try_from(s.clone()).ok())
+            .cloned()
             .collect();
 
         if all.is_empty() {
             return;
         }
 
-        match merkle::recover(all, &self.reed_solomon_cache) {
+        // Use the public `shred::recover` (wraps merkle::recover internally).
+        match solana_ledger::shred::recover(all, &self.reed_solomon_cache) {
             Ok(iter) => {
                 let mut count = 0usize;
                 for result in iter {
-                    if let Ok(merkle_shred) = result {
-                        let shred = Shred::from(merkle_shred);
+                    if let Ok(shred) = result {
                         if shred.is_data() {
                             let idx = shred.index();
                             buf.data_shreds.entry(idx).or_insert(shred);
@@ -277,22 +272,40 @@ impl SlotAssembler {
     }
 }
 
-fn shred_data_bytes(shred: &Shred) -> Result<&[u8], solana_ledger::shred::Error> {
-    match shred {
-        Shred::ShredData(sd) => match sd {
-            ShredData::Legacy(inner)  => inner.data(),
-            ShredData::Merkle(inner)  => inner.data(),
-        },
-        Shred::ShredCode(_) => Err(solana_ledger::shred::Error::InvalidShredType),
+/// Extract the entry data bytes from a data shred using the public payload API.
+///
+/// Solana data shred layout (both legacy and Merkle):
+///   [0..64)   = Signature
+///   [64..83)  = CommonShredHeader (variant:1, slot:8, index:4, version:2, fec_set_index:4)
+///   [83..85)  = parent_slot_offset (DataShredHeader)
+///   [85..86)  = flags (DataShredHeader)
+///   [86..88)  = data size, LE u16 (DataShredHeader)
+///   [88..88+size) = actual entry data
+///
+/// For Merkle shreds the proof is appended AFTER the data; `size` bounds it correctly.
+fn shred_data_bytes(shred: &Shred) -> Option<&[u8]> {
+    if !shred.is_data() {
+        return None;
     }
+    let raw: &[u8] = &shred.payload().bytes;
+    if raw.len() < 88 {
+        return None;
+    }
+    let size = u16::from_le_bytes([raw[86], raw[87]]) as usize;
+    let end  = 88 + size;
+    if end > raw.len() {
+        return None;
+    }
+    Some(&raw[88..end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use solana_entry::entry::Entry;
+    use solana_hash::Hash;
+    use solana_keypair::Keypair;
     use solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder};
-    use solana_sdk::{hash::Hash, signature::Keypair};
 
     pub fn make_test_shreds(slot: u64) -> (Vec<Shred>, Vec<Shred>) {
         let parent_slot = slot.saturating_sub(1);
@@ -304,12 +317,12 @@ mod tests {
         }];
         let shredder = Shredder::new(slot, parent_slot, 0, 0).unwrap();
         let cache    = ReedSolomonCache::default();
-        let (data, coding) = shredder.entries_to_shreds(
+        let (data, coding) = shredder.entries_to_merkle_shreds_for_tests(
             &keypair,
             entries.as_slice(),
             true,
-            None,
-            0, 0, true,
+            Hash::default(),
+            0, 0,
             &cache,
             &mut ProcessShredsStats::default(),
         );
