@@ -27,6 +27,14 @@ solana-entry  = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" 
 anyhow        = "1"
 tempfile      = "3"
 
+# Gossip stack (same agave v3.1.5 tag as Colibri's proven Phase-0 setup).
+solana-gossip    = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+solana-net-utils = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+solana-streamer  = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+solana-pubkey    = "=3.0.0"
+solana-hash      = "=3.1.0"
+log              = "0.4"
+
 [dev-dependencies]
 # Generate real merkle shreds in reconstruction tests via
 # `Shredder::entries_to_merkle_shreds_for_tests` (reachable through the normal

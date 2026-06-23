@@ -1,5 +1,10 @@
 //! `shred-net` — the shared P2P "complete lane" for Colibri and Lumen.
 //!
+//! NB: agave v3.1.5 marks the gossip/contact-info APIs `deprecated` pending the
+//! formal `agave-unstable-api` gate in v4.0.0; we acknowledge and use them.
+#![allow(deprecated)]
+//!
+//!
 //! This crate owns the Phase-0-proven machinery for participating in Solana's
 //! shred network as an unstaked node and reconstructing complete blocks:
 //!
@@ -17,6 +22,7 @@
 //! the complete block. Both consumers wrap it: Colibri's complete lane and
 //! Lumen's `P2pRepairSource`.
 
+pub mod gossip;
 pub mod reconstruct;
 pub mod repair;
 pub mod wire;
