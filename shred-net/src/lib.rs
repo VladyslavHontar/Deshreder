@@ -17,4 +17,5 @@
 //! the complete block. Both consumers wrap it: Colibri's complete lane and
 //! Lumen's `P2pRepairSource`.
 
+pub mod reconstruct;
 pub mod wire;
