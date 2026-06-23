@@ -1,0 +1,418 @@
+//! `ShredNet` — the runnable wiring that turns the crate's pieces into a live
+//! complete-lane: join gossip, receive turbine shreds, drive repair until each
+//! targeted slot is `is_full`, and emit the reconstructed block to a sink.
+//!
+//! Threading (all `std::thread`, no imposed async runtime — both Colibri and
+//! Lumen embed this):
+//!   - gossip threads (owned by `GossipService`)
+//!   - TVU thread     — recv turbine shreds → Blockstore + fast-lane sink hook
+//!   - repair thread  — ping-pong responder + per-slot repair driver + emit
+//!
+//! Acceptance is a live mainnet run (like Phase 0), not unit tests: the socket
+//! I/O and peer dynamics can only be exercised against the real cluster.
+
+use {
+    crate::{
+        gossip::{self, GossipConfig},
+        reconstruct::Reconstructor,
+        repair::{next_repair_action, RepairAction},
+        wire,
+    },
+    solana_entry::entry::Entry,
+    solana_keypair::Keypair,
+    std::{
+        collections::{HashMap, VecDeque},
+        net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+        sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc, Mutex,
+        },
+        thread::{sleep, JoinHandle},
+        time::{Duration, Instant},
+    },
+};
+
+/// Receives reconstructed blocks (and, optionally, the raw fast-lane shred feed).
+pub trait BlockSink: Send + Sync + 'static {
+    /// A targeted slot reached `is_full()`; `entries` is the complete block.
+    fn on_complete_block(&self, slot: u64, entries: Vec<Entry>);
+    /// Every raw shred as it arrives (turbine + repair). Default: ignore.
+    /// Colibri's fast lane uses this; Lumen's complete lane can skip it.
+    fn on_raw_shred(&self, _bytes: &[u8]) {}
+}
+
+/// Configuration for a `ShredNet` instance.
+pub struct ShredNetConfig {
+    pub advertise_ip: IpAddr,
+    pub gossip_port:  u16,
+    pub tvu_port:     u16,
+    pub repair_port:  u16,
+    pub shred_version: Option<u16>,
+    pub entrypoints:  Vec<String>,
+    /// Purge slots below `tip - keep_window` to bound the ephemeral store.
+    pub keep_window:  u64,
+}
+
+impl Default for ShredNetConfig {
+    fn default() -> Self {
+        Self {
+            advertise_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            gossip_port: 8000,
+            tvu_port: 8200,
+            repair_port: 8210,
+            shred_version: None,
+            entrypoints: Vec::new(),
+            keep_window: 8_000,
+        }
+    }
+}
+
+/// Per-targeted-slot driver bookkeeping (the have/last_index/is_full state lives
+/// in the Blockstore via `Reconstructor`; only repair *policy* state is here).
+struct DriverState {
+    last_repair:    Instant,
+    repair_rounds:  u32,
+    highest_probed: bool,
+    deadline:       Instant,
+}
+
+impl DriverState {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            last_repair: now - Duration::from_secs(1),
+            repair_rounds: 0,
+            highest_probed: false,
+            deadline: now + Duration::from_secs(30),
+        }
+    }
+}
+
+/// A live shred-network participant + repair-driven reconstructor.
+pub struct ShredNet {
+    exit:         Arc<AtomicBool>,
+    targets:      Arc<Mutex<VecDeque<u64>>>,
+    stakes:       Arc<Mutex<HashMap<[u8; 32], u64>>>,
+    observed_tip: Arc<AtomicU64>,
+    handles:      Vec<JoinHandle<()>>,
+    // Kept alive so gossip threads keep running; never read directly.
+    _gossip:      solana_gossip::gossip_service::GossipService,
+}
+
+impl ShredNet {
+    /// Join gossip and start the TVU + repair threads. Returns immediately; the
+    /// node runs in the background until [`ShredNet::shutdown`].
+    pub fn start(
+        cfg: ShredNetConfig,
+        keypair: Arc<Keypair>,
+        sink: Arc<dyn BlockSink>,
+    ) -> anyhow::Result<Self> {
+        let exit = Arc::new(AtomicBool::new(false));
+        let node = gossip::join(
+            &GossipConfig {
+                advertise_ip: cfg.advertise_ip,
+                gossip_port: cfg.gossip_port,
+                tvu_port: cfg.tvu_port,
+                shred_version: cfg.shred_version,
+                entrypoints: cfg.entrypoints.clone(),
+            },
+            keypair.clone(),
+            exit.clone(),
+        )?;
+
+        let reconstructor = Arc::new(Reconstructor::new()?);
+        let targets: Arc<Mutex<VecDeque<u64>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let stakes: Arc<Mutex<HashMap<[u8; 32], u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let observed_tip = Arc::new(AtomicU64::new(0));
+
+        let mut handles = Vec::new();
+        handles.push(spawn_tvu(
+            cfg.tvu_port,
+            exit.clone(),
+            reconstructor.clone(),
+            sink.clone(),
+            observed_tip.clone(),
+        )?);
+        handles.push(spawn_repair(
+            &cfg,
+            keypair,
+            exit.clone(),
+            node.cluster_info.clone(),
+            reconstructor,
+            sink,
+            targets.clone(),
+            stakes.clone(),
+            observed_tip.clone(),
+        )?);
+
+        Ok(Self {
+            exit,
+            targets,
+            stakes,
+            observed_tip,
+            handles,
+            _gossip: node.gossip_service,
+        })
+    }
+
+    /// Enqueue slots to repair-until-complete. Idempotent; duplicates are
+    /// coalesced by the driver.
+    pub fn request_slots(&self, slots: impl IntoIterator<Item = u64>) {
+        let mut q = self.targets.lock().unwrap_or_else(|e| e.into_inner());
+        q.extend(slots);
+    }
+
+    /// Update the stake table used to weight repair-peer selection (node pubkey
+    /// → activated stake). Lumen feeds this from LMDB; empty ⇒ recency-only.
+    pub fn set_stakes(&self, map: HashMap<[u8; 32], u64>) {
+        *self.stakes.lock().unwrap_or_else(|e| e.into_inner()) = map;
+    }
+
+    /// Highest slot observed on the TVU socket so far (0 until the first shred).
+    pub fn observed_tip(&self) -> u64 {
+        self.observed_tip.load(Ordering::Relaxed)
+    }
+
+    /// Signal shutdown and join the worker threads.
+    pub fn shutdown(self) {
+        self.exit.store(true, Ordering::SeqCst);
+        for h in self.handles {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Extract a shred's slot from raw bytes (LE u64 at offset 65), gated on the
+/// shred-variant byte at offset 64 — same recognizer as `wire::parse_inbound`.
+fn slot_of(buf: &[u8]) -> Option<u64> {
+    if buf.len() < 88 {
+        return None;
+    }
+    let variant = buf[64];
+    let is_shred = matches!(variant & 0xF0, 0x80 | 0x90 | 0xB0) || variant == 0xA5;
+    if !is_shred {
+        return None;
+    }
+    Some(u64::from_le_bytes(buf[65..73].try_into().ok()?))
+}
+
+fn spawn_tvu(
+    tvu_port: u16,
+    exit: Arc<AtomicBool>,
+    reconstructor: Arc<Reconstructor>,
+    sink: Arc<dyn BlockSink>,
+    observed_tip: Arc<AtomicU64>,
+) -> anyhow::Result<JoinHandle<()>> {
+    let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    let tvu_socket = UdpSocket::bind(SocketAddr::new(bind_ip, tvu_port))?;
+    tvu_socket.set_read_timeout(Some(Duration::from_millis(10)))?;
+    set_recv_buffer(&tvu_socket, 32 * 1024 * 1024);
+
+    Ok(std::thread::spawn(move || {
+        let mut buf = [0u8; 1280];
+        loop {
+            if exit.load(Ordering::Relaxed) {
+                break;
+            }
+            match tvu_socket.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    let bytes = &buf[..n];
+                    if let Some(slot) = slot_of(bytes) {
+                        observed_tip.fetch_max(slot, Ordering::Relaxed);
+                    }
+                    reconstructor.insert_packet(bytes);
+                    sink.on_raw_shred(bytes);
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => log::warn!("[shred-net][tvu] recv error: {e}"),
+            }
+        }
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_repair(
+    cfg: &ShredNetConfig,
+    keypair: Arc<Keypair>,
+    exit: Arc<AtomicBool>,
+    cluster_info: Arc<solana_gossip::cluster_info::ClusterInfo>,
+    reconstructor: Arc<Reconstructor>,
+    sink: Arc<dyn BlockSink>,
+    targets: Arc<Mutex<VecDeque<u64>>>,
+    stakes: Arc<Mutex<HashMap<[u8; 32], u64>>>,
+    observed_tip: Arc<AtomicU64>,
+) -> anyhow::Result<JoinHandle<()>> {
+    const TARGET_WINDOW: usize = 256;
+    const TOP_PEERS: usize = 20;
+    const ORPHAN_AFTER: u32 = 5;
+
+    let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    let repair_sock = UdpSocket::bind(SocketAddr::new(bind_ip, cfg.repair_port))?;
+    repair_sock.set_read_timeout(Some(Duration::from_millis(5)))?;
+    let keep_window = cfg.keep_window;
+
+    Ok(std::thread::spawn(move || {
+        let mut driver: HashMap<u64, DriverState> = HashMap::new();
+        let mut nonce: u32 = 0xdead_beef;
+        let mut recv_buf = [0u8; 1500];
+        let mut last_purge = Instant::now();
+
+        loop {
+            if exit.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // ── drain inbound: ping → pong, shred → Blockstore + fast lane ──
+            let mut drained = 0usize;
+            while drained < 512 {
+                match repair_sock.recv_from(&mut recv_buf) {
+                    Ok((n, src)) => {
+                        match wire::parse_inbound(&recv_buf[..n]) {
+                            wire::Inbound::Ping(token) => {
+                                let pong = wire::build_pong(&keypair, token);
+                                let _ = repair_sock.send_to(&pong, src);
+                            }
+                            wire::Inbound::ShredResponse => {
+                                reconstructor.insert_packet(&recv_buf[..n]);
+                                sink.on_raw_shred(&recv_buf[..n]);
+                            }
+                            wire::Inbound::Other => {}
+                        }
+                        drained += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            sleep(Duration::from_millis(50));
+
+            // ── admit new targets up to the in-flight window ──
+            {
+                let active = driver.len();
+                let mut room = TARGET_WINDOW.saturating_sub(active);
+                let mut q = targets.lock().unwrap_or_else(|e| e.into_inner());
+                while room > 0 {
+                    match q.pop_front() {
+                        Some(slot) => {
+                            driver.entry(slot).or_insert_with(DriverState::new);
+                            room -= 1;
+                        }
+                        None => break,
+                    }
+                }
+            }
+
+            // ── select peers ──
+            let now_ms = now_millis();
+            let stake_map = stakes.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let peers = gossip::repair_peers(&cluster_info, &stake_map, now_ms, TOP_PEERS);
+            if peers.is_empty() {
+                continue;
+            }
+
+            // ── per-slot repair dispatch ──
+            let mut done = Vec::new();
+            for (&slot, state) in driver.iter_mut() {
+                if Instant::now() >= state.deadline {
+                    done.push(slot);
+                    continue;
+                }
+                if state.last_repair.elapsed() < Duration::from_millis(50) {
+                    continue;
+                }
+
+                let is_full = reconstructor.is_full(slot);
+                let last_index = reconstructor.last_index(slot);
+                let missing = if is_full {
+                    Vec::new()
+                } else {
+                    reconstructor.missing_indices(slot, 128)
+                };
+
+                let action = next_repair_action(
+                    is_full,
+                    last_index,
+                    &missing,
+                    state.highest_probed,
+                    state.repair_rounds,
+                    ORPHAN_AFTER,
+                );
+
+                match action {
+                    RepairAction::Complete => {
+                        if let Some(entries) = reconstructor.take_complete(slot) {
+                            sink.on_complete_block(slot, entries);
+                        }
+                        done.push(slot);
+                    }
+                    RepairAction::Wait => {}
+                    RepairAction::ProbeHighest => {
+                        state.last_repair = Instant::now();
+                        state.repair_rounds += 1;
+                        state.highest_probed = true;
+                        for (pk, addr) in &peers {
+                            let req = wire::highest_window_index(&keypair, pk, slot, 0, nonce);
+                            let _ = repair_sock.send_to(&req, addr);
+                            nonce = nonce.wrapping_add(1);
+                        }
+                    }
+                    RepairAction::RequestOrphan => {
+                        state.last_repair = Instant::now();
+                        state.repair_rounds += 1;
+                        for (pk, addr) in &peers {
+                            let req = wire::orphan(&keypair, pk, slot, nonce);
+                            let _ = repair_sock.send_to(&req, addr);
+                            nonce = nonce.wrapping_add(1);
+                        }
+                    }
+                    RepairAction::RequestWindows(batch) => {
+                        state.last_repair = Instant::now();
+                        state.repair_rounds += 1;
+                        for idx in batch {
+                            for (pk, addr) in &peers {
+                                let req = wire::window_index(&keypair, pk, slot, idx, nonce);
+                                let _ = repair_sock.send_to(&req, addr);
+                                nonce = nonce.wrapping_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+            for slot in done {
+                driver.remove(&slot);
+            }
+
+            // ── janitor: bound the ephemeral store ──
+            if last_purge.elapsed() >= Duration::from_secs(5) {
+                let tip = observed_tip.load(Ordering::Relaxed);
+                if tip > keep_window {
+                    reconstructor.purge_below(tip - keep_window);
+                }
+                last_purge = Instant::now();
+            }
+        }
+    }))
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Best-effort enlarge the UDP receive buffer (turbine bursts overflow the
+/// default). Requires `sysctl net.core.rmem_max` headroom for full effect.
+fn set_recv_buffer(socket: &UdpSocket, bytes: usize) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+        let s2 = unsafe { socket2::Socket::from_raw_fd(socket.as_raw_fd()) };
+        s2.set_recv_buffer_size(bytes).ok();
+        let _ = s2.into_raw_fd(); // don't close the borrowed fd on drop
+    }
+    #[cfg(not(unix))]
+    let _ = (socket, bytes);
+}

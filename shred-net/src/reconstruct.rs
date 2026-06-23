@@ -26,6 +26,9 @@ use {
 /// Owns an ephemeral `Blockstore` in a temp dir (deleted on drop).
 pub struct Reconstructor {
     blockstore: Blockstore,
+    /// Low-water mark for [`Reconstructor::purge_below`]: slots `< low_water`
+    /// have already been purged (so the janitor never rescans them).
+    low_water: std::sync::atomic::AtomicU64,
     // Held only to keep the temp dir alive for the Blockstore's lifetime.
     _dir: TempDir,
 }
@@ -35,7 +38,11 @@ impl Reconstructor {
     pub fn new() -> anyhow::Result<Self> {
         let dir = tempfile::tempdir()?;
         let blockstore = Blockstore::open(dir.path())?;
-        Ok(Self { blockstore, _dir: dir })
+        Ok(Self {
+            blockstore,
+            low_water: std::sync::atomic::AtomicU64::new(0),
+            _dir: dir,
+        })
     }
 
     /// Insert one raw shred packet (from turbine or the repair socket).
@@ -93,6 +100,20 @@ impl Reconstructor {
         // Drop the slot so the ephemeral store stays bounded.
         let _ = self.blockstore.purge_slots(slot, slot, PurgeType::Exact);
         Some(entries)
+    }
+
+    /// Purge every slot below `keep_from` to bound the ephemeral store (turbine
+    /// inserts all near-tip shreds, including slots we never targeted). Tracks a
+    /// low-water mark so each slot range is purged at most once.
+    pub fn purge_below(&self, keep_from: u64) {
+        use std::sync::atomic::Ordering;
+        let from = self.low_water.load(Ordering::Relaxed);
+        if keep_from > from {
+            let _ = self
+                .blockstore
+                .purge_slots(from, keep_from - 1, PurgeType::CompactionFilter);
+            self.low_water.store(keep_from, Ordering::Relaxed);
+        }
     }
 }
 
