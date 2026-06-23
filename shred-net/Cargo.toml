@@ -37,6 +37,8 @@ log              = "0.4"
 socket2          = "0.5"
 
 [dev-dependencies]
+# Logging for the `coverage` example harness (examples may use dev-deps).
+env_logger = "0.11"
 # Generate real merkle shreds in reconstruction tests via
 # `Shredder::entries_to_merkle_shreds_for_tests` (reachable through the normal
 # solana-ledger `agave-unstable-api` dep — no `dev-context-only-utils`, which
