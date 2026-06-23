@@ -18,4 +18,5 @@
 //! Lumen's `P2pRepairSource`.
 
 pub mod reconstruct;
+pub mod repair;
 pub mod wire;
