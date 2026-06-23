@@ -1,0 +1,20 @@
+[package]
+name        = "shred-net"
+version     = "0.1.0"
+edition     = "2024"
+description = "Solana P2P shred network: gossip join + ping-gate + repair + Blockstore reconstruction. The shared 'complete lane' used by Colibri and Lumen."
+license     = "MIT"
+
+[lib]
+name = "shred_net"
+path = "src/lib.rs"
+
+[dependencies]
+# Wire codec (ping/pong + repair request encoders). Pinned to the exact agave
+# v3.1.5 workspace leaf versions — same pins as the sibling `deshredder` crate
+# so the whole workspace resolves one consistent tree (no five8 dep break).
+solana-keypair    = "=3.0.1"
+solana-signer     = "=3.0.0"
+solana-time-utils = "=3.0.0"
+solana-signature  = { version = "=3.1.0", default-features = false }
+sha2              = "0.10"
