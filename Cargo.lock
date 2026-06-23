@@ -5344,6 +5344,7 @@ name = "shred-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "env_logger",
  "log",
  "sha2 0.10.9",
  "socket2 0.5.10",
