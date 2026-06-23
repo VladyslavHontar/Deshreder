@@ -1,3 +1,12 @@
+# This repo is a Cargo workspace holding two sibling crates that share one
+# agave v3.1.5 pin (and therefore one rocksdb build / one Cargo.lock):
+#   - `deshredder` (root package, below) — the fast in-memory shred→entry lane.
+#   - `shred-net`  (member) — gossip join + ping-gate + repair + Blockstore
+#                              reconstruction (the complete lane). Consumed by
+#                              both Colibri and Lumen as the shared P2P crate.
+[workspace]
+members = ["shred-net"]
+
 [package]
 name        = "deshredder"
 version     = "0.1.0"
