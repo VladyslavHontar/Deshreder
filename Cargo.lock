@@ -5346,6 +5346,7 @@ dependencies = [
  "anyhow",
  "log",
  "sha2 0.10.9",
+ "socket2 0.5.10",
  "solana-entry",
  "solana-gossip",
  "solana-hash 3.1.0",

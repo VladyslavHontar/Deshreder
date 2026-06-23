@@ -25,4 +25,7 @@
 pub mod gossip;
 pub mod reconstruct;
 pub mod repair;
+pub mod runner;
 pub mod wire;
+
+pub use runner::{BlockSink, ShredNet, ShredNetConfig};
