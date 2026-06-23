@@ -14,6 +14,10 @@ pub struct SlotEntries {
     pub slot:          u64,
     pub entries:       Vec<Entry>,
     pub entries_bytes: Vec<u8>,
+    /// True only when this emission processed the slot's final (LAST_SHRED_IN_SLOT)
+    /// batch — i.e. the whole slot is reconstructed. False for intermediate
+    /// batches streamed as they complete.
+    pub complete:      bool,
 }
 
 /// Pure shred-to-entry assembler. Zero I/O — no networking, no files, no
@@ -33,9 +37,10 @@ impl Deshredder {
         }
     }
 
-    /// Feed one raw UDP shred packet. Returns newly assembled entries for the
-    /// completed slot, or `None` on duplicates, parse errors, or when the slot
-    /// is not yet complete.
+    /// Feed one raw UDP shred packet. Returns newly assembled entries (for one
+    /// or more entry batches that just became available), or `None` on
+    /// duplicates, parse errors, or when no new entries could be assembled.
+    /// `SlotEntries::complete` indicates whether this emission finished the slot.
     pub fn push_raw(&mut self, bytes: &[u8]) -> Option<SlotEntries> {
         let shred = match solana_ledger::shred::Shred::new_from_serialized_shred(bytes.to_vec()) {
             Ok(s)  => s,
@@ -51,7 +56,7 @@ impl Deshredder {
             return None;
         }
 
-        let (slot, entries) = self.assembler.add_shred(shred);
+        let (slot, entries, complete) = self.assembler.add_shred(shred);
         if entries.is_empty() {
             return None;
         }
@@ -64,7 +69,7 @@ impl Deshredder {
             }
         };
 
-        Some(SlotEntries { slot, entries, entries_bytes })
+        Some(SlotEntries { slot, entries, entries_bytes, complete })
     }
 
     /// Evict stale slot buffers to bound memory. Call every ~100ms.

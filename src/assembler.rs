@@ -12,11 +12,9 @@ struct SlotBuffer {
     failed_fec_sets: HashSet<u32>,
     created_at: Instant,
 
-    // Streaming state.
-    prefix_bytes:      Vec<u8>,
+    // Streaming state: index of the next data shred that begins the next entry batch.
     next_stream_index: u32,
-    stream_cursor_pos: usize,
-    entries_total:     Option<u64>,
+    /// Running count of entries emitted so far (diagnostics).
     entries_emitted:   u64,
 
     // Latency tracking (nanoseconds since created_at).
@@ -32,10 +30,7 @@ impl SlotBuffer {
             recovered_fec_sets: HashSet::new(),
             failed_fec_sets:    HashSet::new(),
             created_at:         Instant::now(),
-            prefix_bytes:       Vec::new(),
             next_stream_index:  0,
-            stream_cursor_pos:  0,
-            entries_total:      None,
             entries_emitted:    0,
             first_entry_ns:     None,
             last_entry_ns:      None,
@@ -62,7 +57,10 @@ impl SlotAssembler {
         }
     }
 
-    pub fn add_shred(&mut self, shred: Shred) -> (u64, Vec<Entry>) {
+    /// Returns `(slot, newly_emitted_entries, slot_complete)`. `slot_complete`
+    /// is true only when this call processed the LAST_SHRED_IN_SLOT batch
+    /// (the whole slot is reconstructed), not merely an intermediate batch.
+    pub fn add_shred(&mut self, shred: Shred) -> (u64, Vec<Entry>, bool) {
         let slot    = shred.slot();
         let fec_idx = shred.fec_set_index();
 
@@ -80,108 +78,107 @@ impl SlotAssembler {
             self.try_fec_recovery(slot, fec_idx);
         }
 
-        self.try_stream_entries(slot)
+        let (slot, entries) = self.try_stream_entries(slot);
+        // The buffer is removed only when LAST_SHRED_IN_SLOT is processed, so a
+        // now-absent slot means the whole slot was just reconstructed.
+        let complete = !self.slots.contains_key(&slot);
+        (slot, entries, complete)
     }
 
+    /// Reconstruct entries one ENTRY BATCH at a time. Solana produces multiple
+    /// batches per slot (one shredding call each); every batch is its own
+    /// length-prefixed `bincode(Vec<Entry>)` spanning a contiguous run of data
+    /// shreds ending at a shred with the DATA_COMPLETE flag. The slot is finished
+    /// only at the shred carrying LAST_SHRED_IN_SLOT. (Treating the whole slot as
+    /// a single blob dropped every batch after the first.)
     fn try_stream_entries(&mut self, slot: u64) -> (u64, Vec<Entry>) {
-        'extend: loop {
-            let next_idx = match self.slots.get(&slot) {
+        let mut emitted: Vec<Entry> = Vec::new();
+
+        loop {
+            let start = match self.slots.get(&slot) {
                 Some(b) => b.next_stream_index,
-                None    => return (slot, vec![]),
+                None    => return (slot, emitted),
             };
 
-            if self.slots[&slot].data_shreds.contains_key(&next_idx) {
-                let data = {
-                    let shred = &self.slots[&slot].data_shreds[&next_idx];
-                    shred_data_bytes(shred).map(|b| b.to_vec())
-                };
-                match data {
-                    Some(bytes) => {
-                        let buf = self.slots.get_mut(&slot).unwrap();
-                        buf.prefix_bytes.extend_from_slice(&bytes);
-                        buf.next_stream_index += 1;
+            // Walk forward to the first present DATA_COMPLETE shred, recovering
+            // gaps via FEC as we go. The batch is the contiguous run [start..=end].
+            let mut idx = start;
+            let batch_end = loop {
+                let present = self.slots.get(&slot)
+                    .map_or(false, |b| b.data_shreds.contains_key(&idx));
+                if present {
+                    if self.slots[&slot].data_shreds[&idx].data_complete() {
+                        break idx;
                     }
-                    None => break 'extend,
+                    idx += 1;
+                } else {
+                    // Gap at idx: try FEC on any unrecovered set, then retry idx.
+                    let pre = self.slots[&slot].data_shreds.len();
+                    for fec in self.unrecovered_fec_sets(slot) {
+                        self.try_fec_recovery(slot, fec);
+                    }
+                    let post = self.slots.get(&slot).map_or(0, |b| b.data_shreds.len());
+                    if post <= pre {
+                        return (slot, emitted); // can't fill the gap yet — wait for more shreds
+                    }
                 }
-            } else {
-                let fec_sets = self.unrecovered_fec_sets(slot);
-                if fec_sets.is_empty() {
-                    break 'extend;
-                }
-                let pre = self.slots[&slot].data_shreds.len();
-                for fec in fec_sets {
-                    self.try_fec_recovery(slot, fec);
-                }
-                let post = self.slots.get(&slot).map_or(0, |b| b.data_shreds.len());
-                if post <= pre {
-                    break 'extend;
-                }
-            }
-        }
-
-        let buf = match self.slots.get_mut(&slot) {
-            Some(b) => b,
-            None    => return (slot, vec![]),
-        };
-
-        if buf.entries_total.is_none() {
-            if buf.prefix_bytes.len() < 8 {
-                return (slot, vec![]);
-            }
-            let count = u64::from_le_bytes(buf.prefix_bytes[0..8].try_into().unwrap());
-            buf.entries_total     = Some(count);
-            buf.stream_cursor_pos = 8;
-            eprintln!("[assembler] slot {slot}: stream start, total_entries={count}");
-        }
-
-        let total = buf.entries_total.unwrap();
-        let mut newly_emitted: Vec<Entry> = Vec::new();
-
-        while buf.entries_emitted < total {
-            let pos = buf.stream_cursor_pos;
-            let result = {
-                let slice  = &buf.prefix_bytes[pos..];
-                let mut c  = std::io::Cursor::new(slice);
-                bincode::deserialize_from::<_, Entry>(&mut c)
-                    .map(|e| (e, c.position() as usize))
             };
-            match result {
-                Ok((entry, consumed)) => {
-                    buf.stream_cursor_pos += consumed;
-                    buf.entries_emitted   += 1;
-                    newly_emitted.push(entry);
+
+            // Concatenate the batch's data payloads into one bincode Vec<Entry> blob.
+            let blob: Vec<u8> = {
+                let b = &self.slots[&slot];
+                let mut v = Vec::new();
+                for i in start..=batch_end {
+                    match shred_data_bytes(&b.data_shreds[&i]) {
+                        Some(bytes) => v.extend_from_slice(bytes),
+                        None        => return (slot, emitted), // malformed shred — wait
+                    }
                 }
-                Err(_) => break,
-            }
-        }
+                v
+            };
 
-        if !newly_emitted.is_empty() {
-            let elapsed = buf.created_at.elapsed().as_nanos() as u64;
-            if buf.first_entry_ns.is_none() {
-                buf.first_entry_ns = Some(elapsed);
-                let ts_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                eprintln!("[first_tx] slot={slot} ts={ts_ms} elapsed={}µs", elapsed / 1_000);
-            }
-            buf.last_entry_ns = Some(elapsed);
-        }
+            // deserialize_from tolerates trailing bytes (last-shred padding bounded by `size`).
+            let mut cur = std::io::Cursor::new(&blob[..]);
+            let batch_entries = match bincode::deserialize_from::<_, Vec<Entry>>(&mut cur) {
+                Ok(es) => es,
+                Err(_) => return (slot, emitted), // incomplete/corrupt — wait for more shreds
+            };
 
-        if buf.entries_emitted == total && total > 0 {
-            if let (Some(first_ns), Some(last_ns)) = (buf.first_entry_ns, buf.last_entry_ns) {
-                eprintln!(
-                    "[metrics] slot={slot} ts={} first_tx={}µs complete={}µs entries={total}",
-                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
-                    first_ns / 1_000,
-                    last_ns  / 1_000,
-                );
-            }
-            eprintln!("[assembler] slot {slot}: complete, {total} entries");
-            self.slots.remove(&slot);
-        }
+            let last_in_slot = self.slots[&slot].data_shreds[&batch_end].last_in_slot();
+            let n = batch_entries.len() as u64;
+            emitted.extend(batch_entries);
 
-        (slot, newly_emitted)
+            {
+                let b = self.slots.get_mut(&slot).unwrap();
+                b.next_stream_index = batch_end + 1;
+                b.entries_emitted  += n;
+                if n > 0 {
+                    let el = b.created_at.elapsed().as_nanos() as u64;
+                    if b.first_entry_ns.is_none() {
+                        b.first_entry_ns = Some(el);
+                        let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH)
+                            .unwrap_or_default().as_millis();
+                        eprintln!("[first_tx] slot={slot} ts={ts_ms} elapsed={}µs", el / 1_000);
+                    }
+                    b.last_entry_ns = Some(el);
+                }
+            }
+
+            if last_in_slot {
+                let b = &self.slots[&slot];
+                if let (Some(first_ns), Some(last_ns)) = (b.first_entry_ns, b.last_entry_ns) {
+                    eprintln!(
+                        "[metrics] slot={slot} ts={} first_tx={}µs complete={}µs entries={}",
+                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+                        first_ns / 1_000, last_ns / 1_000, b.entries_emitted,
+                    );
+                }
+                eprintln!("[assembler] slot {slot}: complete, {} entries", b.entries_emitted);
+                self.slots.remove(&slot);
+                return (slot, emitted);
+            }
+            // Otherwise more batches may already be available — loop for the next one.
+        }
     }
 
     fn unrecovered_fec_sets(&self, slot: u64) -> Vec<u32> {
@@ -255,11 +252,11 @@ impl SlotAssembler {
             let expired = buf.is_expired(timeout);
             if expired {
                 eprintln!(
-                    "[assembler] evict slot {slot}: data={} coding={} entries={}/{}",
+                    "[assembler] evict slot {slot}: data={} coding={} emitted={} next_idx={}",
                     buf.data_shreds.len(),
                     buf.coding_shreds.len(),
                     buf.entries_emitted,
-                    buf.entries_total.unwrap_or(0),
+                    buf.next_stream_index,
                 );
             }
             !expired
@@ -338,10 +335,51 @@ mod tests {
         let mut assembler = SlotAssembler::new(400);
         let mut all_entries: Vec<Entry> = Vec::new();
         for shred in data_shreds {
-            let (_, entries) = assembler.add_shred(shred);
+            let (_, entries, _) = assembler.add_shred(shred);
             all_entries.extend(entries);
         }
         assert!(!all_entries.is_empty());
+    }
+
+    /// Reproduces the real-slot failure: a slot is produced as MULTIPLE entry
+    /// batches (separate shredding calls), each its own length-prefixed
+    /// `Vec<Entry>` blob, with contiguous data-shred indices and DATA_COMPLETE
+    /// flags marking batch boundaries. We feed ALL shreds (no gaps), so any
+    /// shortfall is purely the assembler's batch handling — not coverage.
+    #[test]
+    fn test_assembles_multi_batch_slot() {
+        let slot = 300u64;
+        let parent = slot - 1;
+        let keypair = Keypair::new();
+        let cache = ReedSolomonCache::default();
+        let shredder = Shredder::new(slot, parent, 0, 0).unwrap();
+
+        let batch1 = vec![Entry { num_hashes: 1, hash: Hash::default(), transactions: vec![] }; 3];
+        let batch2 = vec![Entry { num_hashes: 2, hash: Hash::default(), transactions: vec![] }; 4];
+
+        let (d1, c1) = shredder.entries_to_merkle_shreds_for_tests(
+            &keypair, &batch1, false, Hash::default(), 0, 0, &cache,
+            &mut ProcessShredsStats::default());
+        let (d2, _c2) = shredder.entries_to_merkle_shreds_for_tests(
+            &keypair, &batch2, true, Hash::default(), d1.len() as u32, c1.len() as u32,
+            &cache, &mut ProcessShredsStats::default());
+
+        let mut all_data: Vec<Shred> = d1;
+        all_data.extend(d2);
+        all_data.sort_by_key(|s| s.index());
+
+        let mut assembler = SlotAssembler::new(10_000);
+        let mut entries: Vec<Entry> = Vec::new();
+        for s in all_data {
+            let (_, e, _) = assembler.add_shred(s);
+            entries.extend(e);
+        }
+
+        assert_eq!(
+            entries.len(), 7,
+            "slot has 3+4=7 entries across two batches; assembler returned {}",
+            entries.len()
+        );
     }
 
     #[test]
