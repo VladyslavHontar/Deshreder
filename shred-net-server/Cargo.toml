@@ -1,0 +1,30 @@
+[package]
+name    = "shred-net-server"
+version = "0.1.0"
+edition = "2024"
+description = "Complete-lane gRPC sidecar: runs shred-net's ShredNet (P2P repair → Blockstore reconstruction) and serves each complete block over the Jito-compatible shredstream proto that Lumen already consumes."
+
+[[bin]]
+name = "shred-net-server"
+path = "src/main.rs"
+
+[dependencies]
+# The validated complete lane (sibling workspace member).
+shred-net = { path = "../shred-net" }
+
+# agave v3.1.5 leaf crates — same pins as shred-net so the workspace resolves one
+# tree. solana-entry names the Entry type the BlockSink hands us.
+solana-entry   = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+solana-keypair = "=3.0.1"
+solana-signer  = "=3.0.0"
+
+bincode    = "1"
+tokio      = { version = "1", features = ["full"] }
+anyhow     = "1"
+tonic      = "0.12"
+prost      = "0.13"
+log        = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+tonic-build = "0.12"
