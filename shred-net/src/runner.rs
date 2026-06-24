@@ -244,7 +244,11 @@ fn spawn_repair(
     stakes: Arc<Mutex<HashMap<[u8; 32], u64>>>,
     observed_tip: Arc<AtomicU64>,
 ) -> anyhow::Result<JoinHandle<()>> {
-    const TARGET_WINDOW: usize = 256;
+    // Concentrate repair bandwidth: a wide window dilutes the (rate-limited)
+    // response stream across too many slots, so none completes before its
+    // deadline. A small window lets each in-flight slot accumulate its full
+    // shred set in seconds, then we advance.
+    const TARGET_WINDOW: usize = 32;
     const TOP_PEERS: usize = 20;
     const ORPHAN_AFTER: u32 = 5;
 
@@ -400,15 +404,20 @@ fn spawn_repair(
                     RepairAction::RequestWindows(batch) => {
                         state.last_repair = Instant::now();
                         state.repair_rounds += 1;
-                        for idx in batch {
-                            for (pk, addr) in &peers {
-                                let req = wire::window_index(&keypair, pk, slot, idx, nonce);
-                                match repair_sock.send_to(&req, addr) {
-                                    Ok(_) => diag_reqs += 1,
-                                    Err(_) => diag_send_err += 1,
-                                }
-                                nonce = nonce.wrapping_add(1);
+                        // Ask ONE peer per missing index (rotate across peers and
+                        // across rounds). Broadcasting every index to all 20 peers
+                        // is ~20x redundant — you only need each shred once — and
+                        // the flood trips serve_repair's per-requester rate limit,
+                        // throttling responses to a trickle. Unserved indices are
+                        // naturally retried next round against a different peer.
+                        for (i, idx) in batch.iter().enumerate() {
+                            let (pk, addr) = &peers[(i + state.repair_rounds as usize) % peers.len()];
+                            let req = wire::window_index(&keypair, pk, slot, *idx, nonce);
+                            match repair_sock.send_to(&req, addr) {
+                                Ok(_) => diag_reqs += 1,
+                                Err(_) => diag_send_err += 1,
                             }
+                            nonce = nonce.wrapping_add(1);
                         }
                     }
                 }
