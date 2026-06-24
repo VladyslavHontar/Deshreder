@@ -251,6 +251,11 @@ fn spawn_repair(
     let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     let repair_sock = UdpSocket::bind(SocketAddr::new(bind_ip, cfg.repair_port))?;
     repair_sock.set_read_timeout(Some(Duration::from_millis(5)))?;
+    // Repair RESPONSES (the data path for historical slots) arrive in bursts —
+    // one WindowIndex round fans out to ~20 peers × up to 128 indices, so shreds
+    // come back thousands-at-once. The default ~200KB kernel buffer drops most of
+    // them, forcing endless re-requests. Size it like the TVU socket.
+    set_recv_buffer(&repair_sock, 32 * 1024 * 1024);
     let keep_window = cfg.keep_window;
 
     Ok(std::thread::spawn(move || {
@@ -259,23 +264,41 @@ fn spawn_repair(
         let mut recv_buf = [0u8; 1500];
         let mut last_purge = Instant::now();
 
+        // ── boundary counters (diagnostics) ──
+        let mut diag_reqs: u64 = 0;
+        let mut diag_send_err: u64 = 0;
+        let mut diag_resp: u64 = 0;
+        let mut diag_inserted: u64 = 0;
+        let mut diag_pings: u64 = 0;
+        let mut diag_pongs: u64 = 0;
+        let mut diag_peers: usize = 0;
+        let mut last_diag = Instant::now();
+
         loop {
             if exit.load(Ordering::Relaxed) {
                 break;
             }
 
             // ── drain inbound: ping → pong, shred → Blockstore + fast lane ──
+            // Cap high enough to empty a full burst each cycle (a small cap turns
+            // the 32MB buffer into a slow drip).
             let mut drained = 0usize;
-            while drained < 512 {
+            while drained < 8192 {
                 match repair_sock.recv_from(&mut recv_buf) {
                     Ok((n, src)) => {
                         match wire::parse_inbound(&recv_buf[..n]) {
                             wire::Inbound::Ping(token) => {
+                                diag_pings += 1;
                                 let pong = wire::build_pong(&keypair, token);
-                                let _ = repair_sock.send_to(&pong, src);
+                                if repair_sock.send_to(&pong, src).is_ok() {
+                                    diag_pongs += 1;
+                                }
                             }
                             wire::Inbound::ShredResponse => {
-                                reconstructor.insert_packet(&recv_buf[..n]);
+                                diag_resp += 1;
+                                if reconstructor.insert_packet(&recv_buf[..n]) {
+                                    diag_inserted += 1;
+                                }
                                 sink.on_raw_shred(&recv_buf[..n]);
                             }
                             wire::Inbound::Other => {}
@@ -308,6 +331,7 @@ fn spawn_repair(
             let now_ms = now_millis();
             let stake_map = stakes.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let peers = gossip::repair_peers(&cluster_info, &stake_map, now_ms, TOP_PEERS);
+            diag_peers = peers.len();
             if peers.is_empty() {
                 continue;
             }
@@ -354,7 +378,10 @@ fn spawn_repair(
                         state.highest_probed = true;
                         for (pk, addr) in &peers {
                             let req = wire::highest_window_index(&keypair, pk, slot, 0, nonce);
-                            let _ = repair_sock.send_to(&req, addr);
+                            match repair_sock.send_to(&req, addr) {
+                                Ok(_) => diag_reqs += 1,
+                                Err(_) => diag_send_err += 1,
+                            }
                             nonce = nonce.wrapping_add(1);
                         }
                     }
@@ -363,7 +390,10 @@ fn spawn_repair(
                         state.repair_rounds += 1;
                         for (pk, addr) in &peers {
                             let req = wire::orphan(&keypair, pk, slot, nonce);
-                            let _ = repair_sock.send_to(&req, addr);
+                            match repair_sock.send_to(&req, addr) {
+                                Ok(_) => diag_reqs += 1,
+                                Err(_) => diag_send_err += 1,
+                            }
                             nonce = nonce.wrapping_add(1);
                         }
                     }
@@ -373,7 +403,10 @@ fn spawn_repair(
                         for idx in batch {
                             for (pk, addr) in &peers {
                                 let req = wire::window_index(&keypair, pk, slot, idx, nonce);
-                                let _ = repair_sock.send_to(&req, addr);
+                                match repair_sock.send_to(&req, addr) {
+                                    Ok(_) => diag_reqs += 1,
+                                    Err(_) => diag_send_err += 1,
+                                }
                                 nonce = nonce.wrapping_add(1);
                             }
                         }
@@ -391,6 +424,33 @@ fn spawn_repair(
                     reconstructor.purge_below(tip - keep_window);
                 }
                 last_purge = Instant::now();
+            }
+
+            // ── diagnostics: which boundary is the bottleneck? ──
+            if last_diag.elapsed() >= Duration::from_secs(10) {
+                let secs = last_diag.elapsed().as_secs_f64();
+                let (mut known, mut full) = (0usize, 0usize);
+                for &slot in driver.keys() {
+                    if reconstructor.last_index(slot).is_some() {
+                        known += 1;
+                    }
+                    if reconstructor.is_full(slot) {
+                        full += 1;
+                    }
+                }
+                eprintln!(
+                    "[shred-net][repair] driver={} peers={} | reqs/s={:.0} resp/s={:.0} \
+                     inserted/s={:.0} send_err={} pings={} pongs={} | last_idx_known={}/{} full_in_map={}",
+                    driver.len(), diag_peers,
+                    diag_reqs as f64 / secs,
+                    diag_resp as f64 / secs,
+                    diag_inserted as f64 / secs,
+                    diag_send_err, diag_pings, diag_pongs,
+                    known, driver.len(), full,
+                );
+                diag_reqs = 0; diag_resp = 0; diag_inserted = 0; diag_send_err = 0;
+                diag_pings = 0; diag_pongs = 0;
+                last_diag = Instant::now();
             }
         }
     }))
