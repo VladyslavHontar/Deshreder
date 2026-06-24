@@ -5,7 +5,7 @@
 #                              reconstruction (the complete lane). Consumed by
 #                              both Colibri and Lumen as the shared P2P crate.
 [workspace]
-members = ["shred-net"]
+members = ["shred-net", "shred-net-server"]
 
 [package]
 name        = "deshredder"
