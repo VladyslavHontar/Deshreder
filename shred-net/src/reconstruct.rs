@@ -90,6 +90,13 @@ impl Reconstructor {
         self.blockstore.meta(slot).ok().flatten().and_then(|m| m.last_index)
     }
 
+    /// The slot this block was built on, once any shred has arrived. Slots
+    /// strictly between `parent_slot(slot)` and `slot` were never produced
+    /// (skipped) — this drives skip detection in the repair driver.
+    pub fn parent_slot(&self, slot: u64) -> Option<u64> {
+        self.blockstore.meta(slot).ok().flatten().and_then(|m| m.parent_slot)
+    }
+
     /// Up to `max` missing data-shred indices for `slot` — the set that drives
     /// `WindowIndex` repair requests. Empty when the slot is full or untouched.
     pub fn missing_indices(&self, slot: u64, max: usize) -> Vec<u64> {
@@ -179,6 +186,22 @@ mod tests {
 
         assert!(r.is_full(101));
         assert_eq!(r.take_complete(101).unwrap(), entries);
+    }
+
+    /// `parent_slot` reports the slot this block was built on — the basis for
+    /// skip detection (slots strictly between a block and its parent were never
+    /// produced).
+    #[test]
+    fn parent_slot_reports_the_chained_parent() {
+        // make_multishred_slot(N) shreds with parent = N-1.
+        let (shreds, _entries) = make_multishred_slot(207);
+        let r = Reconstructor::new().unwrap();
+        for s in &shreds {
+            r.insert_packet(raw(s));
+        }
+        assert_eq!(r.parent_slot(207), Some(206));
+        // Untouched slot has no meta → None.
+        assert_eq!(r.parent_slot(999), None);
     }
 
     /// The core complete-lane flow: a slot with a mid-slot gap is incomplete and
