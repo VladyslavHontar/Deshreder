@@ -3,10 +3,22 @@
 //! targeted slot is `is_full`, and emit the reconstructed block to a sink.
 //!
 //! Threading (all `std::thread`, no imposed async runtime — both Colibri and
-//! Lumen embed this):
+//! Lumen embed this). The ingest path is decoupled from dispatch so a slow
+//! rocksdb write never stalls socket draining or request pacing:
 //!   - gossip threads (owned by `GossipService`)
-//!   - TVU thread     — recv turbine shreds → Blockstore + fast-lane sink hook
-//!   - repair thread  — ping-pong responder + per-slot repair driver + emit
+//!   - TVU recv      — recv turbine shreds → insert channel + fast-lane hook
+//!   - repair recv   — recv repair socket: ping→pong inline, shred→insert channel
+//!                     (NO rocksdb on this thread, so it drains continuously and
+//!                     never drops bursts)
+//!   - insert worker — drain the channel and `insert_batch` into the Blockstore,
+//!                     amortizing the rocksdb lock/commit over up to MAX_BATCH
+//!                     shreds per call (the throughput lever)
+//!   - dispatch      — timer-paced: admit targets, pick peers, send repair
+//!                     requests, emit completed blocks, prune
+//!
+//! The channel is BOUNDED: if the insert worker can't keep up, sends fail and
+//! bump `chan_drop` — a direct signal that the bottleneck is the insert path,
+//! not the network.
 //!
 //! Acceptance is a live mainnet run (like Phase 0), not unit tests: the socket
 //! I/O and peer dynamics can only be exercised against the real cluster.
@@ -25,12 +37,18 @@ use {
         net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
+            mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError},
             Arc, Mutex,
         },
         thread::{sleep, JoinHandle},
         time::{Duration, Instant},
     },
 };
+
+/// Max shreds coalesced into a single `insert_batch` (rocksdb commit) call.
+const MAX_BATCH: usize = 1024;
+/// Bounded insert-channel capacity. Full ⇒ insert worker is the bottleneck.
+const INSERT_CHAN_CAP: usize = 65_536;
 
 /// Receives reconstructed blocks (and, optionally, the raw fast-lane shred feed).
 pub trait BlockSink: Send + Sync + 'static {
@@ -54,9 +72,9 @@ pub struct ShredNetConfig {
     /// How many slots to repair in parallel. Throughput is response-bound, so a
     /// wider window only helps if there's enough peer bandwidth to fill it.
     pub target_window: usize,
-    /// How many distinct peers to spread repair requests across. This is the
-    /// primary throughput lever: each peer rate-limits us independently, so the
-    /// aggregate shred-serve rate scales ~linearly with peer count.
+    /// How many distinct peers to spread repair requests across. Each peer
+    /// rate-limits us independently, so aggregate serve-rate scales ~linearly
+    /// with peer count (until the local insert path saturates).
     pub top_peers: usize,
 }
 
@@ -74,6 +92,18 @@ impl Default for ShredNetConfig {
             top_peers: 64,
         }
     }
+}
+
+/// Cross-thread boundary counters for the diagnostic line.
+#[derive(Default)]
+struct Diag {
+    reqs:      AtomicU64,
+    send_err:  AtomicU64,
+    resp:      AtomicU64,
+    inserted:  AtomicU64,
+    pings:     AtomicU64,
+    pongs:     AtomicU64,
+    chan_drop: AtomicU64,
 }
 
 /// Per-targeted-slot driver bookkeeping (the have/last_index/is_full state lives
@@ -109,8 +139,8 @@ pub struct ShredNet {
 }
 
 impl ShredNet {
-    /// Join gossip and start the TVU + repair threads. Returns immediately; the
-    /// node runs in the background until [`ShredNet::shutdown`].
+    /// Join gossip and start the worker threads. Returns immediately; the node
+    /// runs in the background until [`ShredNet::shutdown`].
     pub fn start(
         cfg: ShredNetConfig,
         keypair: Arc<Keypair>,
@@ -133,17 +163,46 @@ impl ShredNet {
         let targets: Arc<Mutex<VecDeque<u64>>> = Arc::new(Mutex::new(VecDeque::new()));
         let stakes: Arc<Mutex<HashMap<[u8; 32], u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let observed_tip = Arc::new(AtomicU64::new(0));
+        let diag = Arc::new(Diag::default());
+
+        // Bounded insert channel — backpressure reveals an insert-bound state.
+        let (insert_tx, insert_rx) = sync_channel::<Vec<u8>>(INSERT_CHAN_CAP);
+
+        // Repair socket is shared: the recv thread reads it (and sends pongs);
+        // the dispatch thread sends requests. UDP send from multiple threads is
+        // fine; only the recv thread calls recv_from.
+        let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let repair_sock = UdpSocket::bind(SocketAddr::new(bind_ip, cfg.repair_port))?;
+        repair_sock.set_read_timeout(Some(Duration::from_millis(5)))?;
+        set_recv_buffer(&repair_sock, 32 * 1024 * 1024);
+        let repair_sock = Arc::new(repair_sock);
 
         let mut handles = Vec::new();
         handles.push(spawn_tvu(
             cfg.tvu_port,
             exit.clone(),
-            reconstructor.clone(),
+            insert_tx.clone(),
             sink.clone(),
             observed_tip.clone(),
+            diag.clone(),
         )?);
-        handles.push(spawn_repair(
+        handles.push(spawn_repair_recv(
+            repair_sock.clone(),
+            exit.clone(),
+            keypair.clone(),
+            insert_tx,
+            sink.clone(),
+            diag.clone(),
+        ));
+        handles.push(spawn_insert_worker(
+            exit.clone(),
+            insert_rx,
+            reconstructor.clone(),
+            diag.clone(),
+        ));
+        handles.push(spawn_dispatch(
             &cfg,
+            repair_sock,
             keypair,
             exit.clone(),
             node.cluster_info.clone(),
@@ -152,7 +211,8 @@ impl ShredNet {
             targets.clone(),
             stakes.clone(),
             observed_tip.clone(),
-        )?);
+            diag,
+        ));
 
         Ok(Self {
             exit,
@@ -164,8 +224,7 @@ impl ShredNet {
         })
     }
 
-    /// Enqueue slots to repair-until-complete. Idempotent; duplicates are
-    /// coalesced by the driver.
+    /// Enqueue slots to repair-until-complete. Idempotent; duplicates coalesce.
     pub fn request_slots(&self, slots: impl IntoIterator<Item = u64>) {
         let mut q = self.targets.lock().unwrap_or_else(|e| e.into_inner());
         q.extend(slots);
@@ -205,12 +264,26 @@ fn slot_of(buf: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(buf[65..73].try_into().ok()?))
 }
 
+/// Hand a shred to the insert worker; count a drop if the channel is full
+/// (insert-bound). Returns false if the channel is disconnected (shutdown).
+fn submit(tx: &SyncSender<Vec<u8>>, bytes: &[u8], diag: &Diag) -> bool {
+    match tx.try_send(bytes.to_vec()) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            diag.chan_drop.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
 fn spawn_tvu(
     tvu_port: u16,
     exit: Arc<AtomicBool>,
-    reconstructor: Arc<Reconstructor>,
+    insert_tx: SyncSender<Vec<u8>>,
     sink: Arc<dyn BlockSink>,
     observed_tip: Arc<AtomicU64>,
+    diag: Arc<Diag>,
 ) -> anyhow::Result<JoinHandle<()>> {
     let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     let tvu_socket = UdpSocket::bind(SocketAddr::new(bind_ip, tvu_port))?;
@@ -229,8 +302,10 @@ fn spawn_tvu(
                     if let Some(slot) = slot_of(bytes) {
                         observed_tip.fetch_max(slot, Ordering::Relaxed);
                     }
-                    reconstructor.insert_packet(bytes);
                     sink.on_raw_shred(bytes);
+                    if !submit(&insert_tx, bytes, &diag) {
+                        break;
+                    }
                 }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
@@ -241,9 +316,83 @@ fn spawn_tvu(
     }))
 }
 
+/// Drains the repair socket continuously — pong replies inline (cheap), shred
+/// responses handed to the insert worker. No rocksdb here, so a slow write can
+/// never stall draining and drop a burst.
+fn spawn_repair_recv(
+    repair_sock: Arc<UdpSocket>,
+    exit: Arc<AtomicBool>,
+    keypair: Arc<Keypair>,
+    insert_tx: SyncSender<Vec<u8>>,
+    sink: Arc<dyn BlockSink>,
+    diag: Arc<Diag>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        loop {
+            if exit.load(Ordering::Relaxed) {
+                break;
+            }
+            match repair_sock.recv_from(&mut buf) {
+                Ok((n, src)) => match wire::parse_inbound(&buf[..n]) {
+                    wire::Inbound::Ping(token) => {
+                        diag.pings.fetch_add(1, Ordering::Relaxed);
+                        let pong = wire::build_pong(&keypair, token);
+                        if repair_sock.send_to(&pong, src).is_ok() {
+                            diag.pongs.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    wire::Inbound::ShredResponse => {
+                        diag.resp.fetch_add(1, Ordering::Relaxed);
+                        sink.on_raw_shred(&buf[..n]);
+                        if !submit(&insert_tx, &buf[..n], &diag) {
+                            break;
+                        }
+                    }
+                    wire::Inbound::Other => {}
+                },
+                Err(_) => {} // WouldBlock/TimedOut on the 5ms read timeout
+            }
+        }
+    })
+}
+
+/// Batches shreds off the channel into the Blockstore — one `insert_batch`
+/// (rocksdb commit) per up-to-MAX_BATCH shreds, instead of one per shred.
+fn spawn_insert_worker(
+    exit: Arc<AtomicBool>,
+    insert_rx: Receiver<Vec<u8>>,
+    reconstructor: Arc<Reconstructor>,
+    diag: Arc<Diag>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(MAX_BATCH);
+        loop {
+            if exit.load(Ordering::Relaxed) {
+                break;
+            }
+            batch.clear();
+            match insert_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(first) => batch.push(first),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            while batch.len() < MAX_BATCH {
+                match insert_rx.try_recv() {
+                    Ok(b) => batch.push(b),
+                    Err(_) => break,
+                }
+            }
+            let n = reconstructor.insert_batch(&batch);
+            diag.inserted.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-fn spawn_repair(
+fn spawn_dispatch(
     cfg: &ShredNetConfig,
+    repair_sock: Arc<UdpSocket>,
     keypair: Arc<Keypair>,
     exit: Arc<AtomicBool>,
     cluster_info: Arc<solana_gossip::cluster_info::ClusterInfo>,
@@ -252,38 +401,17 @@ fn spawn_repair(
     targets: Arc<Mutex<VecDeque<u64>>>,
     stakes: Arc<Mutex<HashMap<[u8; 32], u64>>>,
     observed_tip: Arc<AtomicU64>,
-) -> anyhow::Result<JoinHandle<()>> {
+    diag: Arc<Diag>,
+) -> JoinHandle<()> {
     const ORPHAN_AFTER: u32 = 5;
-    // Concentrate repair bandwidth: a wide window dilutes the (rate-limited)
-    // response stream across too many slots, so none completes before its
-    // deadline. The window must be matched to available peer bandwidth.
     let target_window = cfg.target_window.max(1);
     let top_peers = cfg.top_peers.max(1);
-
-    let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-    let repair_sock = UdpSocket::bind(SocketAddr::new(bind_ip, cfg.repair_port))?;
-    repair_sock.set_read_timeout(Some(Duration::from_millis(5)))?;
-    // Repair RESPONSES (the data path for historical slots) arrive in bursts —
-    // one WindowIndex round fans out to ~20 peers × up to 128 indices, so shreds
-    // come back thousands-at-once. The default ~200KB kernel buffer drops most of
-    // them, forcing endless re-requests. Size it like the TVU socket.
-    set_recv_buffer(&repair_sock, 32 * 1024 * 1024);
     let keep_window = cfg.keep_window;
 
-    Ok(std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut driver: HashMap<u64, DriverState> = HashMap::new();
         let mut nonce: u32 = 0xdead_beef;
-        let mut recv_buf = [0u8; 1500];
         let mut last_purge = Instant::now();
-
-        // ── boundary counters (diagnostics) ──
-        let mut diag_reqs: u64 = 0;
-        let mut diag_send_err: u64 = 0;
-        let mut diag_resp: u64 = 0;
-        let mut diag_inserted: u64 = 0;
-        let mut diag_pings: u64 = 0;
-        let mut diag_pongs: u64 = 0;
-        let mut diag_peers: usize = 0;
         let mut last_diag = Instant::now();
 
         loop {
@@ -291,42 +419,9 @@ fn spawn_repair(
                 break;
             }
 
-            // ── drain inbound: ping → pong, shred → Blockstore + fast lane ──
-            // Cap high enough to empty a full burst each cycle (a small cap turns
-            // the 32MB buffer into a slow drip).
-            let mut drained = 0usize;
-            while drained < 8192 {
-                match repair_sock.recv_from(&mut recv_buf) {
-                    Ok((n, src)) => {
-                        match wire::parse_inbound(&recv_buf[..n]) {
-                            wire::Inbound::Ping(token) => {
-                                diag_pings += 1;
-                                let pong = wire::build_pong(&keypair, token);
-                                if repair_sock.send_to(&pong, src).is_ok() {
-                                    diag_pongs += 1;
-                                }
-                            }
-                            wire::Inbound::ShredResponse => {
-                                diag_resp += 1;
-                                if reconstructor.insert_packet(&recv_buf[..n]) {
-                                    diag_inserted += 1;
-                                }
-                                sink.on_raw_shred(&recv_buf[..n]);
-                            }
-                            wire::Inbound::Other => {}
-                        }
-                        drained += 1;
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            sleep(Duration::from_millis(50));
-
             // ── admit new targets up to the in-flight window ──
             {
-                let active = driver.len();
-                let mut room = target_window.saturating_sub(active);
+                let mut room = target_window.saturating_sub(driver.len());
                 let mut q = targets.lock().unwrap_or_else(|e| e.into_inner());
                 while room > 0 {
                     match q.pop_front() {
@@ -343,95 +438,84 @@ fn spawn_repair(
             let now_ms = now_millis();
             let stake_map = stakes.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let peers = gossip::repair_peers(&cluster_info, &stake_map, now_ms, top_peers);
-            diag_peers = peers.len();
-            if peers.is_empty() {
-                continue;
-            }
 
             // ── per-slot repair dispatch ──
-            let mut done = Vec::new();
-            for (&slot, state) in driver.iter_mut() {
-                if Instant::now() >= state.deadline {
-                    done.push(slot);
-                    continue;
-                }
-                if state.last_repair.elapsed() < Duration::from_millis(50) {
-                    continue;
-                }
-
-                let is_full = reconstructor.is_full(slot);
-                let last_index = reconstructor.last_index(slot);
-                let missing = if is_full {
-                    Vec::new()
-                } else {
-                    reconstructor.missing_indices(slot, 128)
-                };
-
-                let action = next_repair_action(
-                    is_full,
-                    last_index,
-                    &missing,
-                    state.highest_probed,
-                    state.repair_rounds,
-                    ORPHAN_AFTER,
-                );
-
-                match action {
-                    RepairAction::Complete => {
-                        if let Some(entries) = reconstructor.take_complete(slot) {
-                            sink.on_complete_block(slot, entries);
-                        }
+            if !peers.is_empty() {
+                let mut done = Vec::new();
+                for (&slot, state) in driver.iter_mut() {
+                    if Instant::now() >= state.deadline {
                         done.push(slot);
+                        continue;
                     }
-                    RepairAction::Wait => {}
-                    RepairAction::ProbeHighest => {
-                        state.last_repair = Instant::now();
-                        state.repair_rounds += 1;
-                        state.highest_probed = true;
-                        for (pk, addr) in &peers {
-                            let req = wire::highest_window_index(&keypair, pk, slot, 0, nonce);
-                            match repair_sock.send_to(&req, addr) {
-                                Ok(_) => diag_reqs += 1,
-                                Err(_) => diag_send_err += 1,
+                    if state.last_repair.elapsed() < Duration::from_millis(50) {
+                        continue;
+                    }
+
+                    let is_full = reconstructor.is_full(slot);
+                    let last_index = reconstructor.last_index(slot);
+                    let missing = if is_full {
+                        Vec::new()
+                    } else {
+                        reconstructor.missing_indices(slot, 128)
+                    };
+
+                    let action = next_repair_action(
+                        is_full,
+                        last_index,
+                        &missing,
+                        state.highest_probed,
+                        state.repair_rounds,
+                        ORPHAN_AFTER,
+                    );
+
+                    match action {
+                        RepairAction::Complete => {
+                            if let Some(entries) = reconstructor.take_complete(slot) {
+                                sink.on_complete_block(slot, entries);
                             }
-                            nonce = nonce.wrapping_add(1);
+                            done.push(slot);
                         }
-                    }
-                    RepairAction::RequestOrphan => {
-                        state.last_repair = Instant::now();
-                        state.repair_rounds += 1;
-                        for (pk, addr) in &peers {
-                            let req = wire::orphan(&keypair, pk, slot, nonce);
-                            match repair_sock.send_to(&req, addr) {
-                                Ok(_) => diag_reqs += 1,
-                                Err(_) => diag_send_err += 1,
+                        RepairAction::Wait => {}
+                        RepairAction::ProbeHighest => {
+                            state.last_repair = Instant::now();
+                            state.repair_rounds += 1;
+                            state.highest_probed = true;
+                            for (pk, addr) in &peers {
+                                let req = wire::highest_window_index(&keypair, pk, slot, 0, nonce);
+                                send_counted(&repair_sock, &req, addr, &diag);
+                                nonce = nonce.wrapping_add(1);
                             }
-                            nonce = nonce.wrapping_add(1);
                         }
-                    }
-                    RepairAction::RequestWindows(batch) => {
-                        state.last_repair = Instant::now();
-                        state.repair_rounds += 1;
-                        // Ask ONE peer per missing index (rotate across peers and
-                        // across rounds). Broadcasting every index to all 20 peers
-                        // is ~20x redundant — you only need each shred once — and
-                        // the flood trips serve_repair's per-requester rate limit,
-                        // throttling responses to a trickle. Unserved indices are
-                        // naturally retried next round against a different peer.
-                        for (i, idx) in batch.iter().enumerate() {
-                            let (pk, addr) = &peers[(i + state.repair_rounds as usize) % peers.len()];
-                            let req = wire::window_index(&keypair, pk, slot, *idx, nonce);
-                            match repair_sock.send_to(&req, addr) {
-                                Ok(_) => diag_reqs += 1,
-                                Err(_) => diag_send_err += 1,
+                        RepairAction::RequestOrphan => {
+                            state.last_repair = Instant::now();
+                            state.repair_rounds += 1;
+                            for (pk, addr) in &peers {
+                                let req = wire::orphan(&keypair, pk, slot, nonce);
+                                send_counted(&repair_sock, &req, addr, &diag);
+                                nonce = nonce.wrapping_add(1);
                             }
-                            nonce = nonce.wrapping_add(1);
+                        }
+                        RepairAction::RequestWindows(batch) => {
+                            state.last_repair = Instant::now();
+                            state.repair_rounds += 1;
+                            // Ask ONE peer per missing index (rotate across peers
+                            // and rounds). Broadcasting every index to all peers is
+                            // ~Nx redundant and trips serve_repair's per-requester
+                            // rate limit; unserved indices retry next round against
+                            // a different peer.
+                            for (i, idx) in batch.iter().enumerate() {
+                                let (pk, addr) =
+                                    &peers[(i + state.repair_rounds as usize) % peers.len()];
+                                let req = wire::window_index(&keypair, pk, slot, *idx, nonce);
+                                send_counted(&repair_sock, &req, addr, &diag);
+                                nonce = nonce.wrapping_add(1);
+                            }
                         }
                     }
                 }
-            }
-            for slot in done {
-                driver.remove(&slot);
+                for slot in done {
+                    driver.remove(&slot);
+                }
             }
 
             // ── janitor: bound the ephemeral store ──
@@ -455,22 +539,30 @@ fn spawn_repair(
                         full += 1;
                     }
                 }
+                let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed) as f64 / secs;
                 eprintln!(
-                    "[shred-net][repair] driver={} peers={} | reqs/s={:.0} resp/s={:.0} \
-                     inserted/s={:.0} send_err={} pings={} pongs={} | last_idx_known={}/{} full_in_map={}",
-                    driver.len(), diag_peers,
-                    diag_reqs as f64 / secs,
-                    diag_resp as f64 / secs,
-                    diag_inserted as f64 / secs,
-                    diag_send_err, diag_pings, diag_pongs,
+                    "[shred-net] driver={} peers={} | reqs/s={:.0} resp/s={:.0} inserted/s={:.0} \
+                     chan_drop/s={:.0} send_err/s={:.0} pings/s={:.0} pongs/s={:.0} | \
+                     last_idx_known={}/{} full_in_map={}",
+                    driver.len(), peers.len(),
+                    take(&diag.reqs), take(&diag.resp), take(&diag.inserted),
+                    take(&diag.chan_drop), take(&diag.send_err),
+                    take(&diag.pings), take(&diag.pongs),
                     known, driver.len(), full,
                 );
-                diag_reqs = 0; diag_resp = 0; diag_inserted = 0; diag_send_err = 0;
-                diag_pings = 0; diag_pongs = 0;
                 last_diag = Instant::now();
             }
+
+            sleep(Duration::from_millis(10));
         }
-    }))
+    })
+}
+
+fn send_counted(sock: &UdpSocket, req: &[u8], addr: &SocketAddr, diag: &Diag) {
+    match sock.send_to(req, addr) {
+        Ok(_) => diag.reqs.fetch_add(1, Ordering::Relaxed),
+        Err(_) => diag.send_err.fetch_add(1, Ordering::Relaxed),
+    };
 }
 
 fn now_millis() -> u64 {
@@ -480,8 +572,8 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Best-effort enlarge the UDP receive buffer (turbine bursts overflow the
-/// default). Requires `sysctl net.core.rmem_max` headroom for full effect.
+/// Best-effort enlarge the UDP receive buffer (turbine/repair bursts overflow
+/// the default). Requires `sysctl net.core.rmem_max` headroom for full effect.
 fn set_recv_buffer(socket: &UdpSocket, bytes: usize) {
     #[cfg(unix)]
     {
