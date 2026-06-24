@@ -53,6 +53,8 @@ struct Args {
     entrypoints:  Vec<String>,
     keypair_path: Option<String>,
     probe_depth:  u64,
+    top_peers:    usize,
+    window:       usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -63,6 +65,8 @@ fn parse_args() -> Result<Args, String> {
     let mut entrypoints = Vec::new();
     let mut keypair_path = None;
     let mut probe_depth = 6000u64;
+    let mut top_peers = 64usize;
+    let mut window = 64usize;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -75,6 +79,8 @@ fn parse_args() -> Result<Args, String> {
             "--entrypoint"  => { i += 1; entrypoints.push(argv[i].clone()); }
             "--keypair"     => { i += 1; keypair_path = Some(argv[i].clone()); }
             "--probe-depth" => { i += 1; probe_depth = argv[i].parse().map_err(|e| format!("--probe-depth: {e}"))?; }
+            "--top-peers"   => { i += 1; top_peers = argv[i].parse().map_err(|e| format!("--top-peers: {e}"))?; }
+            "--window"      => { i += 1; window = argv[i].parse().map_err(|e| format!("--window: {e}"))?; }
             other => return Err(format!("unknown arg: {other}")),
         }
         i += 1;
@@ -83,6 +89,7 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         ip: ip.ok_or("--ip <PUBLIC_IP> is required")?,
         gossip_port, tvu_port, repair_port, entrypoints, keypair_path, probe_depth,
+        top_peers, window,
     })
 }
 
@@ -96,7 +103,8 @@ fn main() -> anyhow::Result<()> {
         None => Keypair::new(),
     });
     eprintln!("[coverage] pubkey={}  advertise_ip={}", keypair.pubkey(), args.ip);
-    eprintln!("[coverage] entrypoints={}  probe_depth={}", args.entrypoints.len(), args.probe_depth);
+    eprintln!("[coverage] entrypoints={}  probe_depth={}  top_peers={}  window={}",
+        args.entrypoints.len(), args.probe_depth, args.top_peers, args.window);
 
     let sink = Arc::new(CoverageSink {
         completed: AtomicU64::new(0),
@@ -112,6 +120,8 @@ fn main() -> anyhow::Result<()> {
             shred_version: None,
             entrypoints:  args.entrypoints,
             keep_window:  args.probe_depth + 2000,
+            target_window: args.window,
+            top_peers:    args.top_peers,
         },
         keypair,
         sink.clone(),

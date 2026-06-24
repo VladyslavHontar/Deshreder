@@ -51,6 +51,13 @@ pub struct ShredNetConfig {
     pub entrypoints:  Vec<String>,
     /// Purge slots below `tip - keep_window` to bound the ephemeral store.
     pub keep_window:  u64,
+    /// How many slots to repair in parallel. Throughput is response-bound, so a
+    /// wider window only helps if there's enough peer bandwidth to fill it.
+    pub target_window: usize,
+    /// How many distinct peers to spread repair requests across. This is the
+    /// primary throughput lever: each peer rate-limits us independently, so the
+    /// aggregate shred-serve rate scales ~linearly with peer count.
+    pub top_peers: usize,
 }
 
 impl Default for ShredNetConfig {
@@ -63,6 +70,8 @@ impl Default for ShredNetConfig {
             shred_version: None,
             entrypoints: Vec::new(),
             keep_window: 8_000,
+            target_window: 64,
+            top_peers: 64,
         }
     }
 }
@@ -244,13 +253,12 @@ fn spawn_repair(
     stakes: Arc<Mutex<HashMap<[u8; 32], u64>>>,
     observed_tip: Arc<AtomicU64>,
 ) -> anyhow::Result<JoinHandle<()>> {
+    const ORPHAN_AFTER: u32 = 5;
     // Concentrate repair bandwidth: a wide window dilutes the (rate-limited)
     // response stream across too many slots, so none completes before its
-    // deadline. A small window lets each in-flight slot accumulate its full
-    // shred set in seconds, then we advance.
-    const TARGET_WINDOW: usize = 32;
-    const TOP_PEERS: usize = 20;
-    const ORPHAN_AFTER: u32 = 5;
+    // deadline. The window must be matched to available peer bandwidth.
+    let target_window = cfg.target_window.max(1);
+    let top_peers = cfg.top_peers.max(1);
 
     let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     let repair_sock = UdpSocket::bind(SocketAddr::new(bind_ip, cfg.repair_port))?;
@@ -318,7 +326,7 @@ fn spawn_repair(
             // ── admit new targets up to the in-flight window ──
             {
                 let active = driver.len();
-                let mut room = TARGET_WINDOW.saturating_sub(active);
+                let mut room = target_window.saturating_sub(active);
                 let mut q = targets.lock().unwrap_or_else(|e| e.into_inner());
                 while room > 0 {
                     match q.pop_front() {
@@ -334,7 +342,7 @@ fn spawn_repair(
             // ── select peers ──
             let now_ms = now_millis();
             let stake_map = stakes.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let peers = gossip::repair_peers(&cluster_info, &stake_map, now_ms, TOP_PEERS);
+            let peers = gossip::repair_peers(&cluster_info, &stake_map, now_ms, top_peers);
             diag_peers = peers.len();
             if peers.is_empty() {
                 continue;
