@@ -60,6 +60,21 @@ impl Reconstructor {
             .is_ok()
     }
 
+    /// Insert many raw shred packets in ONE `insert_cow_shreds` call. Parses
+    /// each (dropping unparseable bytes) and inserts the lot together, so the
+    /// rocksdb lock + write-batch commit is amortized across the whole batch
+    /// instead of paid per shred. Returns the number of shreds submitted.
+    pub fn insert_batch(&self, raws: &[Vec<u8>]) -> usize {
+        let shreds: Vec<Cow<Shred>> = raws
+            .iter()
+            .filter_map(|b| Shred::new_from_serialized_shred(b.clone()).ok())
+            .map(Cow::Owned)
+            .collect();
+        let n = shreds.len();
+        let _ = self.blockstore.insert_cow_shreds(shreds, None, /*is_trusted=*/ false);
+        n
+    }
+
     /// Is `slot` fully reconstructed (all data shreds `0..=last_index` present)?
     pub fn is_full(&self, slot: u64) -> bool {
         self.blockstore
@@ -149,6 +164,21 @@ mod tests {
 
     fn raw(shred: &Shred) -> &[u8] {
         &shred.payload().bytes
+    }
+
+    /// A whole slot inserted in ONE batched call completes and extracts cleanly
+    /// (the throughput path: amortize rocksdb lock/commit over many shreds).
+    #[test]
+    fn batch_insert_completes_slot_and_extracts_entries() {
+        let (shreds, entries) = make_multishred_slot(101);
+        let raws: Vec<Vec<u8>> = shreds.iter().map(|s| raw(s).to_vec()).collect();
+
+        let r = Reconstructor::new().unwrap();
+        let n = r.insert_batch(&raws);
+        assert_eq!(n, shreds.len(), "all shreds parsed+submitted in one call");
+
+        assert!(r.is_full(101));
+        assert_eq!(r.take_complete(101).unwrap(), entries);
     }
 
     /// The core complete-lane flow: a slot with a mid-slot gap is incomplete and
