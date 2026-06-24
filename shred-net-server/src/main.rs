@@ -53,8 +53,16 @@ impl BlockSink for GrpcSink {
             }
         }
     }
-    // on_slot_skipped: nothing to emit (no block); a future revision could send
-    // an explicit empty-slot marker so the consumer advances without waiting.
+    fn on_slot_skipped(&self, slot: u64) {
+        // Emit an EMPTY Entry message so an in-order replay consumer (Lumen's
+        // gap-closer) knows this slot produced no block and can advance its
+        // replay pointer past it instead of stalling. bincode(empty Vec<Entry>)
+        // deserializes to an empty Vec on the consumer — fast-lane consumers
+        // simply see zero txs (backward-compatible).
+        if let Ok(bytes) = bincode::serialize(&Vec::<Entry>::new()) {
+            let _ = self.entry_tx.send(ProtoEntry { slot, entries: bytes });
+        }
+    }
 }
 
 struct Args {
