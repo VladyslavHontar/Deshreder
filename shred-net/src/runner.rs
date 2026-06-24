@@ -33,7 +33,7 @@ use {
     solana_entry::entry::Entry,
     solana_keypair::Keypair,
     std::{
-        collections::{HashMap, VecDeque},
+        collections::{HashMap, HashSet, VecDeque},
         net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -54,6 +54,11 @@ const INSERT_CHAN_CAP: usize = 65_536;
 pub trait BlockSink: Send + Sync + 'static {
     /// A targeted slot reached `is_full()`; `entries` is the complete block.
     fn on_complete_block(&self, slot: u64, entries: Vec<Entry>);
+    /// A targeted slot was determined to be **skipped** — no block was ever
+    /// produced for it, so there is nothing to reconstruct. Consumers should
+    /// treat it as "accounted for" (Lumen advances replay past it). Default:
+    /// ignore.
+    fn on_slot_skipped(&self, _slot: u64) {}
     /// Every raw shred as it arrives (turbine + repair). Default: ignore.
     /// Colibri's fast lane uses this; Lumen's complete lane can skip it.
     fn on_raw_shred(&self, _bytes: &[u8]) {}
@@ -113,6 +118,8 @@ struct DriverState {
     repair_rounds:  u32,
     highest_probed: bool,
     deadline:       Instant,
+    /// How many times this slot has blown its deadline without completing.
+    retries:        u32,
 }
 
 impl DriverState {
@@ -123,7 +130,15 @@ impl DriverState {
             repair_rounds: 0,
             highest_probed: false,
             deadline: now + Duration::from_secs(30),
+            retries: 0,
         }
+    }
+
+    /// Start a fresh repair attempt after a blown deadline (re-probe from scratch).
+    fn restart(&mut self) {
+        self.deadline = Instant::now() + Duration::from_secs(30);
+        self.repair_rounds = 0;
+        self.highest_probed = false;
     }
 }
 
@@ -404,12 +419,19 @@ fn spawn_dispatch(
     diag: Arc<Diag>,
 ) -> JoinHandle<()> {
     const ORPHAN_AFTER: u32 = 5;
+    // Deadlines with NO block data (last_index never learned) after this many
+    // retries ⇒ the slot was skipped (leader never produced it). A real block
+    // within the repair window yields its highest shred within seconds.
+    const SKIP_AFTER_EMPTY_RETRIES: u32 = 2;
     let target_window = cfg.target_window.max(1);
     let top_peers = cfg.top_peers.max(1);
     let keep_window = cfg.keep_window;
 
     std::thread::spawn(move || {
         let mut driver: HashMap<u64, DriverState> = HashMap::new();
+        // Slots determined to have no block (skipped). Never re-admitted; the
+        // consumer was told via on_slot_skipped.
+        let mut skipped: HashSet<u64> = HashSet::new();
         let mut nonce: u32 = 0xdead_beef;
         let mut last_purge = Instant::now();
         let mut last_diag = Instant::now();
@@ -419,12 +441,14 @@ fn spawn_dispatch(
                 break;
             }
 
-            // ── admit new targets up to the in-flight window ──
+            // ── admit new targets up to the in-flight window (never re-admit a
+            //    slot we've already concluded is skipped) ──
             {
                 let mut room = target_window.saturating_sub(driver.len());
                 let mut q = targets.lock().unwrap_or_else(|e| e.into_inner());
                 while room > 0 {
                     match q.pop_front() {
+                        Some(slot) if skipped.contains(&slot) => continue,
                         Some(slot) => {
                             driver.entry(slot).or_insert_with(DriverState::new);
                             room -= 1;
@@ -441,10 +465,22 @@ fn spawn_dispatch(
 
             // ── per-slot repair dispatch ──
             if !peers.is_empty() {
-                let mut done = Vec::new();
+                let mut done = Vec::new();             // completed → remove
+                let mut backstop_skip = Vec::new();    // no-block-after-retries → skip
+                let mut reveal: Vec<(u64, u64)> = Vec::new(); // (completed slot, its parent)
                 for (&slot, state) in driver.iter_mut() {
                     if Instant::now() >= state.deadline {
-                        done.push(slot);
+                        // Don't drop incomplete slots — a complete lane must reach
+                        // 100% of producible slots. Retry forever; only conclude
+                        // "skipped" when sustained tries yield NO block data.
+                        state.retries += 1;
+                        if reconstructor.last_index(slot).is_none()
+                            && state.retries >= SKIP_AFTER_EMPTY_RETRIES
+                        {
+                            backstop_skip.push(slot);
+                        } else {
+                            state.restart();
+                        }
                         continue;
                     }
                     if state.last_repair.elapsed() < Duration::from_millis(50) {
@@ -470,10 +506,16 @@ fn spawn_dispatch(
 
                     match action {
                         RepairAction::Complete => {
+                            // Read the parent BEFORE purging — slots between it and
+                            // this one were never produced (skip detection).
+                            let parent = reconstructor.parent_slot(slot);
                             if let Some(entries) = reconstructor.take_complete(slot) {
                                 sink.on_complete_block(slot, entries);
                             }
                             done.push(slot);
+                            if let Some(p) = parent {
+                                reveal.push((slot, p));
+                            }
                         }
                         RepairAction::Wait => {}
                         RepairAction::ProbeHighest => {
@@ -516,6 +558,26 @@ fn spawn_dispatch(
                 for slot in done {
                     driver.remove(&slot);
                 }
+                // Backstop skips: no block after sustained retries.
+                for slot in backstop_skip {
+                    driver.remove(&slot);
+                    if skipped.insert(slot) {
+                        sink.on_slot_skipped(slot);
+                    }
+                }
+                // Parent-link skips: every slot strictly between a completed slot
+                // and its parent was never produced. Bounded to slots we're
+                // actively tracking (in `driver`) so we stay within the requested
+                // range; the scan is capped to guard against a pathological gap.
+                for (slot, parent) in reveal {
+                    let mut s = parent + 1;
+                    while s < slot && slot - s <= 1024 {
+                        if driver.remove(&s).is_some() && skipped.insert(s) {
+                            sink.on_slot_skipped(s);
+                        }
+                        s += 1;
+                    }
+                }
             }
 
             // ── janitor: bound the ephemeral store ──
@@ -541,10 +603,10 @@ fn spawn_dispatch(
                 }
                 let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed) as f64 / secs;
                 eprintln!(
-                    "[shred-net] driver={} peers={} | reqs/s={:.0} resp/s={:.0} inserted/s={:.0} \
+                    "[shred-net] driver={} peers={} skipped={} | reqs/s={:.0} resp/s={:.0} inserted/s={:.0} \
                      chan_drop/s={:.0} send_err/s={:.0} pings/s={:.0} pongs/s={:.0} | \
                      last_idx_known={}/{} full_in_map={}",
-                    driver.len(), peers.len(),
+                    driver.len(), peers.len(), skipped.len(),
                     take(&diag.reqs), take(&diag.resp), take(&diag.inserted),
                     take(&diag.chan_drop), take(&diag.send_err),
                     take(&diag.pings), take(&diag.pongs),

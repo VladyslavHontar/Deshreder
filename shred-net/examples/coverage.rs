@@ -30,9 +30,10 @@ use {
     },
 };
 
-/// Counts completed slots and the transactions inside them.
+/// Counts completed slots, their transactions, and slots concluded to be skipped.
 struct CoverageSink {
     completed: AtomicU64,
+    skipped:   AtomicU64,
     txs:       AtomicU64,
 }
 
@@ -41,6 +42,9 @@ impl BlockSink for CoverageSink {
         self.completed.fetch_add(1, Ordering::Relaxed);
         let n: usize = entries.iter().map(|e| e.transactions.len()).sum();
         self.txs.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    fn on_slot_skipped(&self, _slot: u64) {
+        self.skipped.fetch_add(1, Ordering::Relaxed);
     }
     // Fast-lane hook unused here; we measure the complete lane only.
 }
@@ -108,6 +112,7 @@ fn main() -> anyhow::Result<()> {
 
     let sink = Arc::new(CoverageSink {
         completed: AtomicU64::new(0),
+        skipped: AtomicU64::new(0),
         txs: AtomicU64::new(0),
     });
 
@@ -151,15 +156,22 @@ fn main() -> anyhow::Result<()> {
     loop {
         sleep(Duration::from_secs(10));
         let done = sink.completed.load(Ordering::Relaxed);
+        let skipped = sink.skipped.load(Ordering::Relaxed);
         let txs  = sink.txs.load(Ordering::Relaxed);
-        let pct  = (done as f64 / requested as f64) * 100.0;
+        let accounted = done + skipped;
+        let pct  = (accounted as f64 / requested as f64) * 100.0;
         eprintln!(
-            "[coverage] t={:>4}s  complete={done}/{requested} ({pct:.2}%)  txs={txs}  live_tip={}",
+            "[coverage] t={:>4}s  complete={done} skipped={skipped} pending={}/{requested} ({pct:.2}% accounted)  txs={txs}  live_tip={}",
+            requested.saturating_sub(accounted),
             started.elapsed().as_secs(),
             net.observed_tip(),
         );
-        if done >= requested {
-            eprintln!("[coverage] DONE — 100% of the range reached is_full via repair.");
+        // Done when every producible slot is reconstructed and every skipped
+        // slot is identified — i.e. nothing is left pending.
+        if accounted >= requested {
+            eprintln!(
+                "[coverage] DONE — {done} reconstructed + {skipped} skipped = 100% of the range accounted for."
+            );
             break;
         }
     }
