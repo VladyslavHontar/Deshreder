@@ -21,7 +21,7 @@ use {
     std::{
         net::IpAddr,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc,
         },
         thread::sleep,
@@ -141,6 +141,9 @@ fn main() -> anyhow::Result<()> {
 
     // gRPC server on the tokio runtime.
     let grpc_addr = format!("0.0.0.0:{}", args.grpc_port).parse()?;
+    // Lowest slot a consumer asked to repair from (via `from-slot` metadata).
+    // 0 = none yet → the request loop falls back to `--depth`.
+    let requested_from = Arc::new(AtomicU64::new(0));
     {
         let _guard = rt.enter();
         start_grpc_server(
@@ -148,6 +151,7 @@ fn main() -> anyhow::Result<()> {
             Arc::new(entry_tx.clone()),
             Arc::new(tx_tx.clone()),
             args.auth_token.clone(),
+            requested_from.clone(),
             exit.clone(),
         );
     }
@@ -172,7 +176,11 @@ fn main() -> anyhow::Result<()> {
             repair_port:  args.repair_port,
             shred_version: None,
             entrypoints:  args.entrypoints,
-            keep_window:  args.depth + 2_000,
+            // Retain enough Blockstore history that a slow-completing backlog
+            // slot near the consumer's floor isn't janitor-purged before it
+            // finishes (the gap can be larger than --depth when driven by
+            // from-slot). Cover the repair window.
+            keep_window:  args.depth.max(30_000) + 2_000,
             target_window: args.window,
             top_peers:    args.top_peers,
         },
@@ -191,24 +199,49 @@ fn main() -> anyhow::Result<()> {
         sleep(Duration::from_millis(250));
     }
 
-    let tip = net.observed_tip();
-    let mut last_req = tip.saturating_sub(args.depth);
-    if tip > last_req {
-        net.request_slots(last_req..=tip.saturating_sub(1));
-    }
-    last_req = tip.saturating_sub(1);
-    eprintln!("[server] boot gap requested up to tip={tip}; now serving + gap-filling.");
+    // Repair the moving frontier [floor .. live_tip], where `floor` is the
+    // consumer's reported LMDB tip (`from-slot`), or `tip - depth` as fallback.
+    // `served_floor` = lowest slot we've requested; `last_req` = highest.
+    let mut served_floor: Option<u64> = None;
+    let mut last_req: u64 = 0;
+    eprintln!("[server] serving + gap-filling (floor follows the consumer's lmdb tip)");
 
     loop {
         if exit.load(Ordering::Relaxed) {
             break;
         }
-        sleep(Duration::from_millis(400));
         let tip = net.observed_tip();
+        if tip == 0 {
+            sleep(Duration::from_millis(250));
+            continue;
+        }
+
+        // Lower bound: the consumer's frontier, else --depth fallback.
+        let rf = requested_from.load(Ordering::Relaxed);
+        let floor = if rf > 0 { rf } else { tip.saturating_sub(args.depth) };
+
+        match served_floor {
+            None => {
+                net.request_slots(floor..=tip.saturating_sub(1));
+                eprintln!("[server] repairing from floor={floor} up to tip={tip}");
+                served_floor = Some(floor);
+                last_req = tip.saturating_sub(1);
+            }
+            // A (new/reconnected) consumer asked for an older floor → backfill.
+            Some(sf) if floor < sf => {
+                net.request_slots(floor..=sf.saturating_sub(1));
+                eprintln!("[server] backfilling floor {sf} → {floor}");
+                served_floor = Some(floor);
+            }
+            _ => {}
+        }
+
+        // Upper bound: follow the chain.
         if tip > last_req + 1 {
             net.request_slots((last_req + 1)..=(tip - 1));
             last_req = tip - 1;
         }
+        sleep(Duration::from_millis(400));
     }
 
     net.shutdown();
