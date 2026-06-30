@@ -6,7 +6,7 @@ use {
     std::{
         net::SocketAddr,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc,
         },
     },
@@ -30,9 +30,12 @@ pub use shredstream::Entry as ProtoEntry;
 pub use shredstream::Transaction as ProtoTransaction;
 
 struct Service {
-    entry_sender: Arc<Sender<Entry>>,
-    tx_sender:    Arc<Sender<Transaction>>,
-    auth_token:   Option<Arc<String>>,
+    entry_sender:  Arc<Sender<Entry>>,
+    tx_sender:     Arc<Sender<Transaction>>,
+    auth_token:    Option<Arc<String>>,
+    /// Lowest slot any subscriber asked to repair from (`from-slot` metadata).
+    /// 0 = none yet (the request loop falls back to `--depth`).
+    requested_from: Arc<AtomicU64>,
 }
 
 fn check_auth(
@@ -62,6 +65,16 @@ impl ShredstreamProxy for Service {
         request: Request<SubscribeEntriesRequest>,
     ) -> Result<Response<Self::SubscribeEntriesStream>, Status> {
         check_auth(&self.auth_token, request.metadata())?;
+        // `from-slot`: the consumer's LMDB frontier — repair from here upward.
+        // Keep the lowest any subscriber asked for (0 = none → --depth fallback).
+        if let Some(v) = request.metadata().get("from-slot").and_then(|v| v.to_str().ok()) {
+            if let Ok(from) = v.parse::<u64>() {
+                let cur = self.requested_from.load(Ordering::Relaxed);
+                if from > 0 && (cur == 0 || from < cur) {
+                    self.requested_from.store(from, Ordering::Relaxed);
+                }
+            }
+        }
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let mut bcast = self.entry_sender.subscribe();
         tokio::spawn(async move {
@@ -116,11 +129,12 @@ impl ShredstreamProxy for Service {
 
 /// Spawn the gRPC server on the current tokio runtime. Stops when `exit` is set.
 pub fn start_grpc_server(
-    addr:         SocketAddr,
-    entry_sender: Arc<Sender<Entry>>,
-    tx_sender:    Arc<Sender<Transaction>>,
-    auth_token:   Option<String>,
-    exit:         Arc<AtomicBool>,
+    addr:           SocketAddr,
+    entry_sender:   Arc<Sender<Entry>>,
+    tx_sender:      Arc<Sender<Transaction>>,
+    auth_token:     Option<String>,
+    requested_from: Arc<AtomicU64>,
+    exit:           Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         eprintln!("[grpc] listening on {addr}");
@@ -128,6 +142,7 @@ pub fn start_grpc_server(
             entry_sender,
             tx_sender,
             auth_token: auth_token.map(Arc::new),
+            requested_from,
         };
         let shutdown = async move {
             loop {
