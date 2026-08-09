@@ -43,6 +43,7 @@ pub struct SlotEntries {
     pub slot: u64,                          // Solana slot number
     pub entries: Vec<solana_entry::Entry>,   // decoded entries with transactions
     pub entries_bytes: Vec<u8>,             // bincode-serialized entries (ready for gRPC)
+    pub complete: bool,                     // true on the batch that finishes the slot
 }
 ```
 
@@ -59,13 +60,9 @@ pub struct SlotEntries {
 ## Build
 
 ```bash
-cargo build -p deshredder
+cargo build
 ```
 
-## gRPC subscriber example
+## Scope
 
-A working example that subscribes to a [Colibri](https://github.com/VladyslavHontar/Colibri) gRPC transaction stream:
-
-```bash
-cargo run --example subscribe -- --url http://127.0.0.1:8888
-```
+This crate is assembly only: bytes in, transactions out. It does no networking — no gossip, no TVU sockets, no repair protocol, no gRPC. If you need the full pipeline (join the network, receive and repair shreds, serve transactions over gRPC), that is [Colibri](https://github.com/VladyslavHontar/Colibri), which uses this library as its assembly engine.
