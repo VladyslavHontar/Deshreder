@@ -61,10 +61,14 @@ impl Deshredder {
             return None;
         }
 
-        let entries_bytes = match bincode::serialize(&entries) {
+        // agave 4.3.0 dropped serde from `Entry` in favour of wincode
+        // (`#[derive(SchemaWrite, SchemaRead)]`). wincode is byte-compatible
+        // with bincode, so the gRPC payload on the wire is unchanged and
+        // existing consumers keep deserializing it with bincode.
+        let entries_bytes = match wincode::serialize(&entries) {
             Ok(b)  => b,
             Err(e) => {
-                eprintln!("[deshredder] bincode::serialize failed for slot {slot}: {e}");
+                eprintln!("[deshredder] wincode::serialize failed for slot {slot}: {e}");
                 return None;
             }
         };
