@@ -1,15 +1,24 @@
-use solana_entry::entry::Entry;
-use solana_ledger::shred::{ReedSolomonCache, Shred};
-use std::collections::{HashMap, HashSet};
+//! Shred assembler: buffers data shreds per slot and emits entry batches
+//! as they complete.
+//!
+//! **No erasure recovery.** agave 4.3.0 moved `shred::recover` onto
+//! `ShredRecoveryContext`, whose constructor needs an `Arc<Bank>` and a
+//! retransmit channel — solana-runtime, for a crate that is meant to stay a
+//! pure library. Coding shreds are therefore dropped and gaps are filled by
+//! the consumer's repair driver, which is already how completeness is
+//! achieved (see Colibri's `shred-net/src/reconstruct.rs`). Recovering
+//! locally again would mean vendoring Reed-Solomon over the public
+//! `ShredCode`/`ShredData` types.
+
+use solana_entry::{block_component::BlockComponent, entry::Entry};
+use solana_ledger::shred::Shred;
+use std::collections::HashMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 struct SlotBuffer {
     data_shreds:   HashMap<u32, Shred>,
-    coding_shreds: HashMap<u32, Shred>,
     /// FEC sets where we actually recovered ≥1 data shred.
-    recovered_fec_sets: HashSet<u32>,
     /// FEC sets that failed last time we tried — skip until new shreds arrive.
-    failed_fec_sets: HashSet<u32>,
     created_at: Instant,
 
     // Streaming state: index of the next data shred that begins the next entry batch.
@@ -26,9 +35,6 @@ impl SlotBuffer {
     fn new() -> Self {
         Self {
             data_shreds:        HashMap::new(),
-            coding_shreds:      HashMap::new(),
-            recovered_fec_sets: HashSet::new(),
-            failed_fec_sets:    HashSet::new(),
             created_at:         Instant::now(),
             next_stream_index:  0,
             entries_emitted:    0,
@@ -45,7 +51,6 @@ impl SlotBuffer {
 pub(crate) struct SlotAssembler {
     slots:              HashMap<u64, SlotBuffer>,
     slot_timeout_ms:    u64,
-    reed_solomon_cache: ReedSolomonCache,
 }
 
 impl SlotAssembler {
@@ -53,7 +58,6 @@ impl SlotAssembler {
         Self {
             slots: HashMap::new(),
             slot_timeout_ms,
-            reed_solomon_cache: ReedSolomonCache::default(),
         }
     }
 
@@ -61,21 +65,16 @@ impl SlotAssembler {
     /// is true only when this call processed the LAST_SHRED_IN_SLOT batch
     /// (the whole slot is reconstructed), not merely an intermediate batch.
     pub fn add_shred(&mut self, shred: Shred) -> (u64, Vec<Entry>, bool) {
-        let slot    = shred.slot();
-        let fec_idx = shred.fec_set_index();
+        let slot = shred.slot();
 
         {
             let buf = self.slots.entry(slot).or_insert_with(SlotBuffer::new);
+            // Coding shreds are dropped: completeness comes from
+            // repair-until-full, not local erasure recovery (see the note at
+            // the top of this file).
             if shred.is_data() {
                 buf.data_shreds.insert(shred.index(), shred);
-            } else if shred.is_code() {
-                buf.coding_shreds.insert(shred.index(), shred);
             }
-            buf.failed_fec_sets.remove(&fec_idx);
-        }
-
-        if !self.slots[&slot].recovered_fec_sets.contains(&fec_idx) {
-            self.try_fec_recovery(slot, fec_idx);
         }
 
         let (slot, entries) = self.try_stream_entries(slot);
@@ -112,19 +111,13 @@ impl SlotAssembler {
                     }
                     idx += 1;
                 } else {
-                    // Gap at idx: try FEC on any unrecovered set, then retry idx.
-                    let pre = self.slots[&slot].data_shreds.len();
-                    for fec in self.unrecovered_fec_sets(slot) {
-                        self.try_fec_recovery(slot, fec);
-                    }
-                    let post = self.slots.get(&slot).map_or(0, |b| b.data_shreds.len());
-                    if post <= pre {
-                        return (slot, emitted); // can't fill the gap yet — wait for more shreds
-                    }
+                    // Gap at idx — the repair driver fetches it; nothing to do
+                    // locally now that erasure recovery is gone.
+                    return (slot, emitted);
                 }
             };
 
-            // Concatenate the batch's data payloads into one bincode Vec<Entry> blob.
+            // Concatenate the batch's data payloads into one BlockComponent blob.
             let blob: Vec<u8> = {
                 let b = &self.slots[&slot];
                 let mut v = Vec::new();
@@ -137,10 +130,21 @@ impl SlotAssembler {
                 v
             };
 
-            // deserialize_from tolerates trailing bytes (last-shred padding bounded by `size`).
-            let mut cur = std::io::Cursor::new(&blob[..]);
-            let batch_entries = match bincode::deserialize_from::<_, Vec<Entry>>(&mut cur) {
-                Ok(es) => es,
+            // agave 4.3.0 wraps the payload in a `BlockComponent`: 8 bytes of
+            // entry count, then either that many entries or — when the count is
+            // zero — a block marker (header / footer / update-parent).
+            //
+            // Pre-Alpenglow blocks need no special case: a bare bincode
+            // `Vec<Entry>` is byte-identical to `BlockComponent::EntryBatch`
+            // (wincode is bincode-compatible and `Vec` leads with the same u64
+            // length), and markers only exist once the feature is live.
+            //
+            // Markers yield no entries, matching agave's own `get_slot_entries`
+            // (blockstore.rs:5185). Extracting the footer's bank hash from them
+            // is the next step, not this one.
+            let batch_entries = match wincode::deserialize::<BlockComponent>(&blob) {
+                Ok(BlockComponent::EntryBatch(es)) => es,
+                Ok(BlockComponent::BlockMarker(_)) => Vec::new(),
                 Err(_) => return (slot, emitted), // incomplete/corrupt — wait for more shreds
             };
 
@@ -181,69 +185,6 @@ impl SlotAssembler {
         }
     }
 
-    fn unrecovered_fec_sets(&self, slot: u64) -> Vec<u32> {
-        let buf = match self.slots.get(&slot) {
-            Some(b) => b,
-            None    => return vec![],
-        };
-        buf.coding_shreds
-            .values()
-            .map(|s| s.fec_set_index())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .filter(|fec| {
-                !buf.recovered_fec_sets.contains(fec) && !buf.failed_fec_sets.contains(fec)
-            })
-            .collect()
-    }
-
-    fn try_fec_recovery(&mut self, slot: u64, fec_set_index: u32) {
-        let buf = match self.slots.get_mut(&slot) {
-            Some(b) => b,
-            None    => return,
-        };
-
-        // Collect both data and coding shreds for this FEC set.
-        let all: Vec<Shred> = buf
-            .data_shreds
-            .values()
-            .filter(|s| s.fec_set_index() == fec_set_index)
-            .chain(
-                buf.coding_shreds
-                    .values()
-                    .filter(|s| s.fec_set_index() == fec_set_index),
-            )
-            .cloned()
-            .collect();
-
-        if all.is_empty() {
-            return;
-        }
-
-        // Use the public `shred::recover` (wraps merkle::recover internally).
-        match solana_ledger::shred::recover(all, &self.reed_solomon_cache) {
-            Ok(iter) => {
-                let mut count = 0usize;
-                for result in iter {
-                    if let Ok(shred) = result {
-                        if shred.is_data() {
-                            let idx = shred.index();
-                            buf.data_shreds.entry(idx).or_insert(shred);
-                            count += 1;
-                        }
-                    }
-                }
-                if count > 0 {
-                    buf.recovered_fec_sets.insert(fec_set_index);
-                } else {
-                    buf.failed_fec_sets.insert(fec_set_index);
-                }
-            }
-            Err(_) => {
-                buf.failed_fec_sets.insert(fec_set_index);
-            }
-        }
-    }
 
     pub fn evict_expired(&mut self) -> usize {
         let timeout = self.slot_timeout_ms;
@@ -252,9 +193,8 @@ impl SlotAssembler {
             let expired = buf.is_expired(timeout);
             if expired {
                 eprintln!(
-                    "[assembler] evict slot {slot}: data={} coding={} emitted={} next_idx={}",
+                    "[assembler] evict slot {slot}: data={} emitted={} next_idx={}",
                     buf.data_shreds.len(),
-                    buf.coding_shreds.len(),
                     buf.entries_emitted,
                     buf.next_stream_index,
                 );
@@ -299,7 +239,7 @@ fn shred_data_bytes(shred: &Shred) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_entry::entry::Entry;
+    use solana_entry::{block_component::BlockComponent, entry::Entry};
     use solana_hash::Hash;
     use solana_keypair::Keypair;
     use solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder};

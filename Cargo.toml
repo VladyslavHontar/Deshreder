@@ -12,14 +12,19 @@ path = "src/lib.rs"
 [dependencies]
 # agave-unstable-api makes solana_ledger::shred pub (instead of pub(crate)).
 # Same feature used by solana-gossip, so colibri's full dep tree shares one rocksdb.
-solana-ledger = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5", features = ["agave-unstable-api"] }
-solana-entry  = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+solana-ledger = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0", features = ["agave-unstable-api"] }
+solana-entry  = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0" }
+
+# agave 4.3.0 serialises `Entry` with wincode instead of serde. Pinned to the
+# version agave's Cargo.lock resolves; wincode is byte-compatible with bincode,
+# so the emitted gRPC payload does not change.
+wincode = "0.6.1"
 bincode       = "1"
 
 # Pin leaf crates to exact agave v3.1.5 workspace versions to prevent Cargo
 # from resolving to newer crates.io releases that have a broken five8 dep chain.
-solana-keypair   = "=3.0.1"
-solana-signature = { version = "=3.1.0", default-features = false }
+solana-keypair   = "=3.1.2"
+solana-signature = { version = "=3.5.2", default-features = false }
 
 [dev-dependencies]
-solana-hash = "=3.1.0"
+solana-hash = "=4.6.0"
