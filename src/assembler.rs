@@ -57,6 +57,10 @@ struct SlotState {
     fec: BTreeMap<u32, FecSet>,
     /// First index of the next batch not yet emitted.
     next: u32,
+    /// Highest data index seen so far (`received` in agave's SlotMeta).
+    received: Option<u32>,
+    /// Index of the LAST_SHRED_IN_SLOT data shred, once seen.
+    last_index: Option<u32>,
 }
 
 #[derive(Default)]
@@ -84,6 +88,10 @@ impl Assembler {
         let shard = wire::shard(packet, &h);
         match h.kind {
             Kind::Data { .. } => {
+                state.received = Some(state.received.map_or(h.index, |r| r.max(h.index)));
+                if h.last_in_slot() {
+                    state.last_index = Some(h.index);
+                }
                 // First arrival wins; a duplicate is a no-op.
                 state.data.entry(h.index).or_insert_with(|| DataShred {
                     header: h,
@@ -123,6 +131,39 @@ impl Assembler {
 
     pub fn active_slots(&self) -> usize {
         self.slots.len()
+    }
+
+    // ── what a repair driver needs to know, and nothing more ─────────────
+    //
+    // The assembler reports its own gaps; filling them (peers, requests,
+    // timeouts, retries) is the caller's job. This mirrors agave's split
+    // between the blockstore's SlotMeta / find_missing_data_indexes and
+    // repair_service, which only reads them.
+
+    /// Highest data index seen for `slot`, if any shred has arrived.
+    pub fn received(&self, slot: u64) -> Option<u32> {
+        self.slots.get(&slot)?.received
+    }
+
+    /// Index of the LAST_SHRED_IN_SLOT shred, once it has been seen. `None`
+    /// means the slot's length is still unknown.
+    pub fn last_index(&self, slot: u64) -> Option<u32> {
+        self.slots.get(&slot)?.last_index
+    }
+
+    /// Data indices still missing for `slot`, in order, at most `limit`.
+    ///
+    /// Everything below the next unemitted batch is already assembled and
+    /// dropped, so gaps are searched only in `[next, end]`, where `end` is
+    /// `last_index` if known, else the highest index received so far. Once
+    /// the slot is complete this is empty.
+    pub fn missing(&self, slot: u64, limit: usize) -> Vec<u32> {
+        let Some(state) = self.slots.get(&slot) else { return Vec::new() };
+        let Some(end) = state.last_index.or(state.received) else { return Vec::new() };
+        (state.next..=end)
+            .filter(|i| !state.data.contains_key(i))
+            .take(limit)
+            .collect()
     }
 }
 
@@ -168,6 +209,9 @@ fn recover(state: &mut SlotState, slot: u64, fec_set_index: u32) {
         let Some(header) = wire::parse_data_shard(&shard) else { continue };
         if header.slot != slot || header.index != index || header.fec_set_index != fec_set_index {
             continue;
+        }
+        if header.last_in_slot() {
+            state.last_index = Some(index);
         }
         state.data.insert(index, DataShred { header, shard });
     }
@@ -383,6 +427,40 @@ mod tests {
         assert_eq!(a.evict_below(1001), 1);
         assert!(feed(&mut a, data).is_empty(), "history stays dropped");
         assert_eq!(a.active_slots(), 0);
+    }
+
+    #[test]
+    fn reports_gaps_but_never_below_the_emitted_frontier() {
+        let (data, _) = shred_component(1100, &BlockComponent::EntryBatch(entries(100)), true, 0);
+        let last = data.len() as u32 - 1;
+        let mut a = Assembler::new();
+        // Nothing yet: no length, no gaps to report.
+        assert_eq!(a.last_index(1100), None);
+        assert_eq!(a.missing(1100, 10), Vec::<u32>::new());
+        // Only the last shred: length known, everything before it missing.
+        feed(&mut a, [data[last as usize].clone()]);
+        assert_eq!(a.last_index(1100), Some(last));
+        assert_eq!(a.received(1100), Some(last));
+        assert_eq!(a.missing(1100, 3), vec![0, 1, 2], "limit is honoured");
+        assert_eq!(a.missing(1100, 1000).len(), last as usize);
+        // Fill all but index 1: the report is exactly that one hole.
+        feed(&mut a, data.iter().enumerate().filter(|(i, _)| *i != 1 && *i != last as usize).map(|(_, s)| s.clone()));
+        assert_eq!(a.missing(1100, 10), vec![1]);
+        // Fill it: slot completes, state is gone, nothing to report.
+        feed(&mut a, [data[1].clone()]);
+        assert_eq!(a.active_slots(), 0);
+        assert_eq!(a.missing(1100, 10), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn missing_uses_received_when_length_is_unknown() {
+        let (data, _) = shred_component(1200, &BlockComponent::EntryBatch(entries(100)), true, 0);
+        assert!(data.len() >= 4);
+        let mut a = Assembler::new();
+        feed(&mut a, [data[3].clone()]);
+        assert_eq!(a.last_index(1200), None, "last shred not seen");
+        assert_eq!(a.received(1200), Some(3));
+        assert_eq!(a.missing(1200, 10), vec![0, 1, 2], "gaps up to the highest seen index");
     }
 
     #[test]

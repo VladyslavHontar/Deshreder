@@ -6,6 +6,11 @@
 //!                              ──▶ Event::SlotComplete
 //! ```
 //!
+//! It also reports what it lacks — `received`, `last_index`, `missing` — so
+//! a repair driver can decide what to fetch. It never fetches anything itself:
+//! peers, requests, timeouts and retries live with the caller. Assembles;
+//! reports gaps; does not fill them.
+//!
 //! No I/O, no clock, no logging, no rocksdb: the library depends on
 //! `solana-entry` for the `BlockComponent` codec and `reed-solomon-erasure`
 //! for recovering lost data shreds from coding shreds. Signature checks are
