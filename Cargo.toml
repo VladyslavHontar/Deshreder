@@ -1,8 +1,8 @@
 [package]
 name        = "deshredder"
-version     = "0.1.0"
+version     = "0.2.0"
 edition     = "2024"
-description = "Pure Solana shred assembler library — zero I/O, zero async deps"
+description = "Pure Solana shred assembler library — raw packets in, block components out; zero I/O"
 license     = "MIT"
 
 [lib]
@@ -10,21 +10,27 @@ name = "deshredder"
 path = "src/lib.rs"
 
 [dependencies]
-# agave-unstable-api makes solana_ledger::shred pub (instead of pub(crate)).
-# Same feature used by solana-gossip, so colibri's full dep tree shares one rocksdb.
-solana-ledger = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0", features = ["agave-unstable-api"] }
-solana-entry  = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0" }
+# `BlockComponent` / `Entry` and their wincode codec — the only agave crate the
+# library needs. The shred wire layout is parsed here (see src/wire.rs), so
+# solana-ledger and the rocksdb it drags in are dev-only.
+solana-entry = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0" }
+solana-hash  = "=4.6.0"
+wincode      = "0.6.1"
+# Rebuilds lost data shreds from coding shreds. Same crate agave shreds with,
+# so the GF(2^8) field and shard order match by construction. Default features
+# only: `simd-accel` needs a C toolchain and recovery runs only on packet loss.
+reed-solomon-erasure = "6.0.0"
 
-# agave 4.3.0 serialises `Entry` with wincode instead of serde. Pinned to the
-# version agave's Cargo.lock resolves; wincode is byte-compatible with bincode,
-# so the emitted gRPC payload does not change.
-wincode = "0.6.1"
-bincode       = "1"
-
-# Pin leaf crates to exact agave v3.1.5 workspace versions to prevent Cargo
-# from resolving to newer crates.io releases that have a broken five8 dep chain.
+[dev-dependencies]
+# Real Merkle shreds for the tests come from agave's own Shredder.
+solana-ledger    = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0", features = ["agave-unstable-api"] }
+# Exact pins matching the agave v4.3.0 workspace, so cargo does not resolve a
+# newer crates.io release with the broken five8 dep chain.
 solana-keypair   = "=3.1.2"
 solana-signature = { version = "=3.5.2", default-features = false }
 
-[dev-dependencies]
-solana-hash = "=4.6.0"
+# solana-ledger (dev-only) needs anza's rocksdb fork: crates.io rocksdb lacks
+# `new_pinnable_slice` / `get_pinned_cf_into` / `DBPinnableSlice::reset`.
+[patch.crates-io]
+librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
+rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }

@@ -1,93 +1,19 @@
+//! Pure Solana shred assembler: raw packets in, block components out.
+//!
+//! ```text
+//! packet ──▶ Deshredder::push ──▶ Event::Entries      (each batch, as soon as present)
+//!                              ──▶ Event::Footer       (bank hash + producer clock)
+//!                              ──▶ Event::SlotComplete
+//! ```
+//!
+//! No I/O, no clock, no logging, no rocksdb: the library depends on
+//! `solana-entry` for the `BlockComponent` codec and `reed-solomon-erasure`
+//! for recovering lost data shreds from coding shreds. Signature checks are
+//! the caller's job — feed only leader-verified packets.
+
 mod assembler;
-mod dedup;
+mod wire;
 
-use assembler::SlotAssembler;
-use dedup::{Deduplicator, ShredKey};
-
+pub use assembler::{Assembler as Deshredder, Event};
 pub use solana_entry::entry::Entry;
-
-/// A slot together with its assembled entries and the pre-encoded bytes.
-///
-/// `entries_bytes` is `bincode::serialize(&entries)` — ready to stuff into
-/// the Jito-compatible gRPC proto `Entry { slot, entries: entries_bytes }`.
-pub struct SlotEntries {
-    pub slot:          u64,
-    pub entries:       Vec<Entry>,
-    pub entries_bytes: Vec<u8>,
-    /// True only when this emission processed the slot's final (LAST_SHRED_IN_SLOT)
-    /// batch — i.e. the whole slot is reconstructed. False for intermediate
-    /// batches streamed as they complete.
-    pub complete:      bool,
-}
-
-/// Pure shred-to-entry assembler. Zero I/O — no networking, no files, no
-/// async runtime required. Feed raw UDP shred packets, receive Solana entries.
-pub struct Deshredder {
-    assembler: SlotAssembler,
-    dedup:     Deduplicator,
-}
-
-impl Deshredder {
-    /// * `slot_timeout_ms` — evict stale slots after N ms. Recommend `3000`.
-    /// * `max_tracked_slots` — dedup history depth. Recommend `200`.
-    pub fn new(slot_timeout_ms: u64, max_tracked_slots: usize) -> Self {
-        Self {
-            assembler: SlotAssembler::new(slot_timeout_ms),
-            dedup:     Deduplicator::new(max_tracked_slots),
-        }
-    }
-
-    /// Feed one raw UDP shred packet. Returns newly assembled entries (for one
-    /// or more entry batches that just became available), or `None` on
-    /// duplicates, parse errors, or when no new entries could be assembled.
-    /// `SlotEntries::complete` indicates whether this emission finished the slot.
-    pub fn push_raw(&mut self, bytes: &[u8]) -> Option<SlotEntries> {
-        let shred = match solana_ledger::shred::Shred::new_from_serialized_shred(bytes.to_vec()) {
-            Ok(s)  => s,
-            Err(_) => return None,
-        };
-
-        let key = ShredKey {
-            slot:    shred.slot(),
-            index:   shred.index(),
-            is_data: shred.is_data(),
-        };
-        if !self.dedup.is_new(key) {
-            return None;
-        }
-
-        let (slot, entries, complete) = self.assembler.add_shred(shred);
-        if entries.is_empty() {
-            return None;
-        }
-
-        // agave 4.3.0 dropped serde from `Entry` in favour of wincode
-        // (`#[derive(SchemaWrite, SchemaRead)]`). wincode is byte-compatible
-        // with bincode, so the gRPC payload on the wire is unchanged and
-        // existing consumers keep deserializing it with bincode.
-        let entries_bytes = match wincode::serialize(&entries) {
-            Ok(b)  => b,
-            Err(e) => {
-                eprintln!("[deshredder] wincode::serialize failed for slot {slot}: {e}");
-                return None;
-            }
-        };
-
-        Some(SlotEntries { slot, entries, entries_bytes, complete })
-    }
-
-    /// Evict stale slot buffers to bound memory. Call every ~100ms.
-    pub fn evict_expired(&mut self) -> usize {
-        self.assembler.evict_expired()
-    }
-
-    /// Number of slots currently buffering shreds (bounded by calling `evict_expired`).
-    pub fn active_slot_count(&self) -> usize {
-        self.assembler.active_slot_count()
-    }
-
-    /// Number of slots retained in the deduplication history window.
-    pub fn tracked_slot_count(&self) -> usize {
-        self.dedup.tracked_slot_count()
-    }
-}
+pub use solana_hash::Hash;
