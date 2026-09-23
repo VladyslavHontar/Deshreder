@@ -45,7 +45,7 @@ const FLAG_LAST_IN_SLOT: u8 = 0b1100_0000; // both bits set
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    Data { flags: u8, size: u16 },
+    Data { flags: u8, size: u16, parent_offset: u16 },
     Code { num_data: u16, num_code: u16, position: u16 },
 }
 
@@ -115,6 +115,7 @@ fn parse_at(b: &[u8], base: usize) -> Option<Header> {
     let common_end = base + 19;
     let kind = if is_data {
         b.get(common_end + 4)?; // need [83..88) relative to the packet
+        let parent_offset = u16_at(b, common_end);
         let flags = b[common_end + 2];
         let size = u16_at(b, common_end + 3);
         // Absolute end of the data, in packet coordinates. Valid iff it lies
@@ -124,7 +125,7 @@ fn parse_at(b: &[u8], base: usize) -> Option<Header> {
         if s < DATA_HEADERS || s > max {
             return None;
         }
-        Kind::Data { flags, size }
+        Kind::Data { flags, size, parent_offset }
     } else {
         b.get(common_end + 5)?; // need [83..89)
         let num_data = u16_at(b, common_end);
@@ -171,4 +172,43 @@ pub fn shard<'a>(packet: &'a [u8], h: &Header) -> &'a [u8] {
 pub fn data_in_shard<'a>(shard: &'a [u8], h: &Header) -> &'a [u8] {
     let Kind::Data { size, .. } = h.kind else { return &[] };
     &shard[DATA_HEADERS - SIGNATURE..usize::from(size) - SIGNATURE]
+}
+
+// ── merkle root: what the leader signed ─────────────────────────────────────
+//
+// Layout after the erasure shard (`merkle.rs`): chained merkle root (32),
+// then `proof_size` proof entries of 20 bytes, then the retransmitter
+// signature if resigned. The leaf is sha256 over everything between the
+// signature and the proof; the tree is walked with 20-byte-truncated nodes
+// (`merkle_tree.rs` `join_nodes`) and the root is the full 32-byte hash.
+
+const MERKLE_HASH_PREFIX_LEAF: &[u8] = b"\x00SOLANA_MERKLE_SHREDS_LEAF";
+const MERKLE_HASH_PREFIX_NODE: &[u8] = b"\x01SOLANA_MERKLE_SHREDS_NODE";
+
+/// The merkle root a leader signed over this packet, or `None` when the
+/// packet is not a well-formed merkle shred. Verifying the signature at
+/// `packet[0..64]` against it is the caller's job (it needs the leader).
+pub fn merkle_root(packet: &[u8]) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let h = parse_packet(packet)?;
+    let (headers, payload, index) = match h.kind {
+        Kind::Data { .. } => (DATA_HEADERS, DATA_PAYLOAD, h.index.checked_sub(h.fec_set_index)? as usize),
+        Kind::Code { num_data, position, .. } => (CODE_HEADERS, CODE_PAYLOAD, usize::from(num_data) + usize::from(position)),
+    };
+    // headers + capacity + merkle root, with capacity = payload − headers − root − proof − resign.
+    let proof_offset = payload
+        - usize::from(h.proof_size) * PROOF_ENTRY
+        - if h.resigned { SIGNATURE } else { 0 };
+    let proof_end = proof_offset + usize::from(h.proof_size) * PROOF_ENTRY;
+    let _ = headers; // the leaf spans headers and shard alike: [64, proof_offset)
+    let leaf = packet.get(SIGNATURE..proof_offset)?;
+    let proof = packet.get(proof_offset..proof_end)?;
+    let mut node: [u8; 32] = Sha256::new().chain_update(MERKLE_HASH_PREFIX_LEAF).chain_update(leaf).finalize().into();
+    let mut index = index;
+    for other in proof.chunks(PROOF_ENTRY) {
+        let (a, b) = if index % 2 == 0 { (&node[..PROOF_ENTRY], other) } else { (other, &node[..PROOF_ENTRY]) };
+        node = Sha256::new().chain_update(MERKLE_HASH_PREFIX_NODE).chain_update(a).chain_update(b).finalize().into();
+        index >>= 1;
+    }
+    (index == 0).then_some(node)
 }

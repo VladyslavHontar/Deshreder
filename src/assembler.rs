@@ -17,7 +17,7 @@ use solana_entry::block_component::{
 };
 use solana_entry::entry::Entry;
 use solana_hash::Hash;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// What falls out of [`Assembler::push`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,14 +61,16 @@ struct SlotState {
     received: Option<u32>,
     /// Index of the LAST_SHRED_IN_SLOT data shred, once seen.
     last_index: Option<u32>,
+    /// The slot this block builds on (`slot − parent_offset`), from the first data shred.
+    parent: Option<u64>,
 }
 
 #[derive(Default)]
 pub struct Assembler {
     slots: BTreeMap<u64, SlotState>,
-    /// Slots whose LAST_SHRED_IN_SLOT batch was emitted. A late duplicate
-    /// must not resurrect them; pruned by `evict_below`.
-    finished: BTreeSet<u64>,
+    /// Slots whose LAST_SHRED_IN_SLOT batch was emitted, with their parent.
+    /// A late duplicate must not resurrect them; pruned by `evict_below`.
+    finished: BTreeMap<u64, Option<u64>>,
     /// Everything below is history: dropped on sight.
     floor: u64,
 }
@@ -81,14 +83,15 @@ impl Assembler {
     /// Feed one packet. Events, if any, are appended to `out`.
     pub fn push(&mut self, packet: &[u8], out: &mut Vec<Event>) {
         let Some(h) = wire::parse_packet(packet) else { return };
-        if h.slot < self.floor || self.finished.contains(&h.slot) {
+        if h.slot < self.floor || self.finished.contains_key(&h.slot) {
             return;
         }
         let state = self.slots.entry(h.slot).or_default();
         let shard = wire::shard(packet, &h);
         match h.kind {
-            Kind::Data { .. } => {
+            Kind::Data { parent_offset, .. } => {
                 state.received = Some(state.received.map_or(h.index, |r| r.max(h.index)));
+                state.parent.get_or_insert(h.slot.saturating_sub(u64::from(parent_offset)));
                 if h.last_in_slot() {
                     state.last_index = Some(h.index);
                 }
@@ -114,8 +117,8 @@ impl Assembler {
         recover(state, h.slot, h.fec_set_index);
         stream(state, h.slot, out);
         if self.slots[&h.slot].next == u32::MAX {
-            self.slots.remove(&h.slot);
-            self.finished.insert(h.slot);
+            let done = self.slots.remove(&h.slot).expect("slot state");
+            self.finished.insert(h.slot, done.parent);
         }
     }
 
@@ -139,6 +142,20 @@ impl Assembler {
     // timeouts, retries) is the caller's job. This mirrors agave's split
     // between the blockstore's SlotMeta / find_missing_data_indexes and
     // repair_service, which only reads them.
+
+    /// Every batch of `slot` has been emitted (until `evict_below` forgets it).
+    pub fn is_complete(&self, slot: u64) -> bool {
+        self.finished.contains_key(&slot)
+    }
+
+    /// The slot this block builds on, once any data shred has arrived. Slots
+    /// strictly between it and `slot` were never produced.
+    pub fn parent_slot(&self, slot: u64) -> Option<u64> {
+        match self.slots.get(&slot) {
+            Some(state) => state.parent,
+            None => self.finished.get(&slot).copied().flatten(),
+        }
+    }
 
     /// Highest data index seen for `slot`, if any shred has arrived.
     pub fn received(&self, slot: u64) -> Option<u32> {
@@ -316,7 +333,7 @@ mod tests {
             }
         }
         // Equal shard lengths across a set is what makes Reed–Solomon valid.
-        let lens: BTreeSet<usize> = data.iter().chain(&code)
+        let lens: std::collections::BTreeSet<usize> = data.iter().chain(&code)
             .map(|s| wire::parse_packet(&s.payload().bytes).unwrap().shard_len()).collect();
         assert_eq!(lens.len(), 1, "data and code shards must be the same length");
     }
@@ -405,6 +422,33 @@ mod tests {
             Event::Footer { slot: 800, bank_hash: footer.bank_hash, producer_time_nanos: footer.block_producer_time_nanos },
             Event::SlotComplete { slot: 800 },
         ]);
+    }
+
+    #[test]
+    fn parent_and_completion_survive_until_eviction() {
+        let (data, _) = shred_component(500, &BlockComponent::EntryBatch(entries(3)), true, 0);
+        let mut a = Assembler::new();
+        assert_eq!(a.parent_slot(500), None);
+        assert!(!a.is_complete(500));
+        let events = feed(&mut a, data);
+        assert!(matches!(events.last(), Some(Event::SlotComplete { slot: 500 })));
+        assert!(a.is_complete(500));
+        assert_eq!(a.parent_slot(500), Some(499), "Shredder::new(slot, slot - 1, ..)");
+        a.evict_below(501);
+        assert!(!a.is_complete(500));
+        assert_eq!(a.parent_slot(500), None);
+    }
+
+    #[test]
+    fn merkle_root_matches_agave_for_data_and_code() {
+        let (data, code) = shred_component(7, &BlockComponent::EntryBatch(entries(40)), true, 0);
+        assert!(!code.is_empty());
+        for s in data.iter().chain(&code) {
+            let packet = &s.payload().bytes;
+            let ours = crate::wire::merkle_root(packet).expect("merkle root");
+            let theirs = solana_ledger::shred::layout::get_merkle_root(packet).expect("agave root");
+            assert_eq!(ours, theirs.to_bytes(), "index {}", s.index());
+        }
     }
 
     #[test]

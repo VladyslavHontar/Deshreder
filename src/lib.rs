@@ -20,5 +20,6 @@ mod assembler;
 mod wire;
 
 pub use assembler::{Assembler as Deshredder, Event};
+pub use wire::merkle_root;
 pub use solana_entry::entry::Entry;
 pub use solana_hash::Hash;

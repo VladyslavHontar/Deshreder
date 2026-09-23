@@ -20,6 +20,7 @@ wincode      = "0.6.1"
 # so the GF(2^8) field and shard order match by construction. Default features
 # only: `simd-accel` needs a C toolchain and recovery runs only on packet loss.
 reed-solomon-erasure = "6.0.0"
+sha2                 = "0.10"
 
 [dev-dependencies]
 # Real Merkle shreds for the tests come from agave's own Shredder.

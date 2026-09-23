@@ -1695,6 +1695,7 @@ name = "deshredder"
 version = "0.2.0"
 dependencies = [
  "reed-solomon-erasure",
+ "sha2 0.10.9",
  "solana-entry",
  "solana-hash",
  "solana-keypair",
