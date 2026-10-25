@@ -2,9 +2,11 @@
 //!
 //! Per slot, data shreds are kept by index and coding shreds by FEC set. A
 //! FEC set is one Merkle tree, every shred of it signed by the leader through
-//! one root: the first root seen for a set is the set's, and a shred of the
-//! same set under another root is dropped, so two versions of a block from
-//! an equivocating leader never meet in one Reed–Solomon decode. A
+//! one root, and the sets of one block tile its indices. Shreds that
+//! contradict that (a set under two roots, sets that overlap, a data shred
+//! outside its set) are two versions of the block from an equivocating
+//! leader: the slot is given up whole (`Event::Equivocated`), since which
+//! version is the block cannot be told from the shreds. A
 //! batch is a contiguous run of data shreds ending at DATA_COMPLETE; the
 //! moment such a run is present it is decoded as one `BlockComponent` and
 //! emitted — nothing waits for the rest of the slot. When a set has lost
@@ -38,6 +40,11 @@ pub enum Event {
     /// skipped so the slot cannot stall forever; the consumer decides what a
     /// hole means. This should never fire on honest leader output.
     UndecodableBatch { slot: u64, first_index: u32, last_index: u32 },
+    /// The slot's shreds contradict one another: its leader signed two
+    /// versions of the block. Which one is the block cannot be told from the
+    /// shreds, so neither is assembled: the slot's state is dropped and its
+    /// later packets are ignored. Emitted once per slot.
+    Equivocated { slot: u64 },
 }
 
 struct DataShred {
@@ -61,6 +68,10 @@ struct FecSet {
 struct SlotState {
     data: BTreeMap<u32, DataShred>,
     fec: BTreeMap<u32, FecSet>,
+    /// The sets whose size a coding shred told, by first index: their data
+    /// shreds' count. They never overlap, so one lookup finds the one an
+    /// index falls in, however many sets of unknown size lie between.
+    sized: BTreeMap<u32, u16>,
     /// First index of the next batch not yet emitted.
     next: u32,
     /// Highest data index seen so far (`received` in agave's SlotMeta).
@@ -77,6 +88,8 @@ pub struct Assembler {
     /// Slots whose LAST_SHRED_IN_SLOT batch was emitted, with their parent.
     /// A late duplicate must not resurrect them; pruned by `evict_below`.
     finished: BTreeMap<u64, Option<u64>>,
+    /// Slots found to hold two versions of their block; pruned by `evict_below`.
+    equivocated: std::collections::BTreeSet<u64>,
     /// Everything below is history: dropped on sight.
     floor: u64,
     /// Shreds dropped for proving a root other than their set's.
@@ -91,16 +104,36 @@ impl Assembler {
     /// Feed one packet. Events, if any, are appended to `out`.
     pub fn push(&mut self, packet: &[u8], out: &mut Vec<Event>) {
         let Some(h) = wire::parse_packet(packet) else { return };
-        if h.slot < self.floor || self.finished.contains_key(&h.slot) {
+        if h.slot < self.floor || self.finished.contains_key(&h.slot) || self.equivocated.contains(&h.slot) {
             return;
         }
         let Some(root) = wire::merkle_root(packet) else { return };
         let state = self.slots.entry(h.slot).or_default();
-        let set = state.fec.entry(h.fec_set_index).or_insert_with(|| FecSet { root, coding: None, code: BTreeMap::new(), recovered: false });
-        if set.root != root {
+        // What one honest block never holds, each a sign of a second version:
+        // a set under two roots; a data shred naming another set than the
+        // sized one its index falls in, or a sized set it falls outside of; a
+        // coding shred sizing a set over a sized one, a set begun inside it,
+        // or a data shred there or past its end naming another set or it.
+        let contradicts = state.fec.get(&h.fec_set_index).is_some_and(|set| set.root != root)
+            || match h.kind {
+                Kind::Data { .. } => {
+                    covering(state, h.index).is_some_and(|start| start != h.fec_set_index)
+                        || state.sized.get(&h.fec_set_index).is_some_and(|&n| h.index >= h.fec_set_index.saturating_add(n.into()))
+                }
+                Kind::Code { num_data, .. } => match state.sized.get(&h.fec_set_index) {
+                    Some(&n) => n != num_data,
+                    None => overlaps(state, h.fec_set_index, num_data),
+                },
+            };
+        if contradicts {
+            // Neither version is the block for certain: the slot is given up whole.
             self.conflicts += 1;
+            self.slots.remove(&h.slot);
+            self.equivocated.insert(h.slot);
+            out.push(Event::Equivocated { slot: h.slot });
             return;
         }
+        let set = state.fec.entry(h.fec_set_index).or_insert_with(|| FecSet { root, coding: None, code: BTreeMap::new(), recovered: false });
         let shard = wire::shard(packet, &h);
         match h.kind {
             Kind::Data { parent_offset, .. } => {
@@ -120,6 +153,7 @@ impl Assembler {
                 if shard_len == shard.len() && !set.recovered {
                     set.code.entry(position).or_insert_with(|| shard.to_vec());
                 }
+                state.sized.entry(h.fec_set_index).or_insert(num_data);
             }
         }
         recover(state, h.slot, h.fec_set_index);
@@ -136,6 +170,7 @@ impl Assembler {
         let before = self.slots.len();
         self.slots = self.slots.split_off(&slot);
         self.finished = self.finished.split_off(&slot);
+        self.equivocated = self.equivocated.split_off(&slot);
         self.floor = self.floor.max(slot);
         before - self.slots.len()
     }
@@ -144,8 +179,8 @@ impl Assembler {
         self.slots.len()
     }
 
-    /// Shreds dropped so far for proving another root than their set's: a
-    /// leader that sent two versions of a block, or a forger.
+    /// Shreds that contradicted their slot's others, each giving the slot up
+    /// as `Equivocated`.
     pub fn conflicts(&self) -> u64 {
         self.conflicts
     }
@@ -204,31 +239,49 @@ impl Assembler {
     /// enough); of any other, every missing one.
     pub fn needed(&self, slot: u64, limit: usize) -> Vec<u32> {
         let Some(state) = self.slots.get(&slot) else { return Vec::new() };
+        let Some(end) = state.last_index.or(state.received) else { return Vec::new() };
         let mut out = Vec::new();
         // The set the last index fell in, and how many more of it to take.
         let mut current: Option<(u32, usize)> = None;
-        for i in self.missing(slot, usize::MAX) {
-            let set = state.fec.range(..=i).next_back().and_then(|(&start, set)| {
-                let (num_data, _, _) = set.coding?;
-                (i < start + u32::from(num_data)).then_some((start, set, num_data))
-            });
+        for i in (state.next..=end).filter(|i| !state.data.contains_key(i)) {
+            if out.len() == limit {
+                break;
+            }
+            let set = covering(state, i).and_then(|start| Some((start, &state.fec[&start], state.fec[&start].coding?.0)));
             let Some((start, set, num_data)) = set else {
                 out.push(i);
-                if out.len() == limit { break }
                 continue;
             };
             if current.is_none_or(|(s, _)| s != start) {
-                let held = state.data.range(start..start + u32::from(num_data)).count() + set.code.len();
+                let held = state.data.range(start..start.saturating_add(num_data.into())).count() + set.code.len();
                 current = Some((start, usize::from(num_data).saturating_sub(held)));
             }
             if let Some((_, left)) = current.as_mut().filter(|(_, left)| *left > 0) {
                 *left -= 1;
                 out.push(i);
-                if out.len() == limit { break }
             }
         }
         out
     }
+}
+
+/// The first index of the set, of known size, that `index` falls in. Sized
+/// sets never overlap (`overlaps` keeps them apart), so the nearest one at or
+/// below `index` is the only one that can hold it.
+fn covering(state: &SlotState, index: u32) -> Option<u32> {
+    let (&start, &num_data) = state.sized.range(..=index).next_back()?;
+    (index < start.saturating_add(num_data.into())).then_some(start)
+}
+
+/// Whether a set of `num_data` data shreds starting at `start` contradicts
+/// what is held: it lies in a sized set, a set begins inside it, a data shred
+/// in its range names another set, or one past its end names it.
+fn overlaps(state: &SlotState, start: u32, num_data: u16) -> bool {
+    let end = start.saturating_add(num_data.into());
+    covering(state, start).is_some()
+        || state.fec.range(start.saturating_add(1)..end).next().is_some()
+        || state.data.range(start..end).any(|(_, d)| d.header.fec_set_index != start)
+        || state.data.range(end..).any(|(_, d)| d.header.fec_set_index == start)
 }
 
 /// Rebuild missing data shards of one FEC set once enough shards are held.
@@ -497,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn a_set_is_one_root_and_another_version_of_it_is_dropped() {
+    fn a_set_under_two_roots_gives_the_slot_up() {
         let (data, code) = shred_component(1300, &BlockComponent::EntryBatch(entries(40)), true, 0);
         let roots: std::collections::BTreeSet<[u8; 32]> =
             data.iter().chain(&code).map(|s| crate::wire::merkle_root(&s.payload().bytes).unwrap()).collect();
@@ -507,10 +560,12 @@ mod tests {
         let (other, _) = shred_component(1300, &BlockComponent::EntryBatch(entries(41)), true, 0);
         let mut a = Assembler::new();
         feed(&mut a, [data[0].clone()]);
-        assert!(feed(&mut a, other).is_empty(), "nothing of the other version is taken");
-        assert!(a.conflicts() > 0);
-        let ev = feed(&mut a, data[1..].iter().cloned());
-        assert_eq!(collected(&ev), entries(40), "the first version assembles untouched");
+        assert_eq!(feed(&mut a, other), vec![Event::Equivocated { slot: 1300 }], "said once");
+        assert_eq!(a.conflicts(), 1);
+        assert!(feed(&mut a, data[1..].iter().cloned()).is_empty(), "neither version is assembled");
+        assert_eq!((a.active_slots(), a.needed(1300, 10).len()), (0, 0), "nothing kept, nothing to repair");
+        a.evict_below(1301);
+        assert_eq!(a.conflicts(), 1);
     }
 
     #[test]
@@ -529,6 +584,65 @@ mod tests {
         assert!(a.is_complete(1400), "rebuilt with exactly what was asked for");
         assert_eq!(collected(&ev), entries(300));
         assert!(a.needed(1400, 100).is_empty());
+    }
+
+    #[test]
+    fn a_shred_past_what_a_slot_holds_is_refused() {
+        let (data, code) = shred_component(1500, &BlockComponent::EntryBatch(entries(5)), true, 0);
+        let at = |packet: &[u8], index: u32, set: u32| {
+            let mut p = packet.to_vec();
+            p[73..77].copy_from_slice(&index.to_le_bytes());
+            p[79..83].copy_from_slice(&set.to_le_bytes());
+            p
+        };
+        let data = data[0].payload().bytes.to_vec();
+        let code = code[0].payload().bytes.to_vec();
+        let max = wire::MAX_SHREDS_PER_SLOT;
+        assert!(wire::parse_packet(&at(&data, max - 1, max - 1)).is_some(), "the last index a slot holds");
+        assert!(wire::parse_packet(&at(&data, max, max)).is_none(), "one past it");
+        assert!(wire::parse_packet(&at(&data, u32::MAX, 0)).is_none(), "a gap report would walk 4 billion indices");
+        assert!(wire::parse_packet(&at(&data, 3, 4)).is_none(), "a data shred before its own set");
+        assert!(wire::parse_packet(&at(&code, 0, max - 1)).is_none(), "a set whose data would run past the slot");
+    }
+
+    #[test]
+    fn a_data_shred_naming_another_set_than_its_own_gives_the_slot_up() {
+        let (data, code) = shred_component(1600, &BlockComponent::EntryBatch(entries(300)), true, 0);
+        assert!(data.len() >= 6, "one set with room for a stray");
+        // A second version whose shreds start at index 3 as a set of their own:
+        // its index 4 falls in the first version's set, which starts at 0.
+        let (other, _) = shred_component(1600, &BlockComponent::EntryBatch(entries(301)), true, 3);
+        let stray = || other.iter().filter(|s| s.index() == 4).cloned();
+        let mut a = Assembler::new();
+        feed(&mut a, [code[0].clone()]);
+        assert_eq!(feed(&mut a, stray()), vec![Event::Equivocated { slot: 1600 }], "index 4 is set 0's");
+        // The other way round: the stray came first, the set's size after.
+        let mut b = Assembler::new();
+        assert!(feed(&mut b, stray()).is_empty(), "alone it contradicts nothing yet");
+        assert_eq!(feed(&mut b, [code[0].clone()]), vec![Event::Equivocated { slot: 1600 }]);
+    }
+
+    #[test]
+    fn a_given_up_slot_takes_nothing_more() {
+        let (data, code) = shred_component(1700, &BlockComponent::EntryBatch(entries(300)), true, 0);
+        let (other, _) = shred_component(1700, &BlockComponent::EntryBatch(entries(301)), true, 3);
+        let mut a = Assembler::new();
+        feed(&mut a, [code[0].clone()]);
+        let ev = feed(&mut a, other.iter().filter(|s| s.index() == 4 || s.index() == 5).cloned().chain(data.iter().cloned()));
+        assert_eq!(ev, vec![Event::Equivocated { slot: 1700 }]);
+        assert_eq!(a.conflicts(), 1, "later packets of the slot are not even looked at");
+    }
+
+    #[test]
+    fn a_set_sized_over_a_known_one_gives_the_slot_up() {
+        let (data, code) = shred_component(1800, &BlockComponent::EntryBatch(entries(300)), true, 0);
+        let (_, other_code) = shred_component(1800, &BlockComponent::EntryBatch(entries(301)), true, 3);
+        let mut a = Assembler::new();
+        assert!(feed(&mut a, data[..10].iter().chain(&code[..1]).cloned()).is_empty());
+        assert_eq!(feed(&mut a, other_code[..1].iter().cloned()), vec![Event::Equivocated { slot: 1800 }]);
+        // An honest slot next to it is untouched.
+        let (next, _) = shred_component(1801, &BlockComponent::EntryBatch(entries(5)), true, 0);
+        assert_eq!(collected(&feed(&mut a, next)), entries(5));
     }
 
     #[test]

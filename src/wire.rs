@@ -40,6 +40,12 @@ const CODE_HEADERS: usize = 89; // signature + common (19) + coding header (6)
 const MERKLE_ROOT: usize = 32;
 const PROOF_ENTRY: usize = 20;
 
+/// Data shreds a slot may hold, and coding shreds alike: agave's
+/// `DEFAULT_MAX_DATA_SHREDS_PER_SLOT` (`cost-model/src/shred_limit.rs`),
+/// past which its own `sanitize` rejects a shred. An index past it would have
+/// a gap report walk billions of indices.
+pub const MAX_SHREDS_PER_SLOT: u32 = 32_768;
+
 const FLAG_DATA_COMPLETE: u8 = 0b0100_0000;
 const FLAG_LAST_IN_SLOT: u8 = 0b1100_0000; // both bits set
 
@@ -134,12 +140,22 @@ fn parse_at(b: &[u8], base: usize) -> Option<Header> {
         if num_data == 0 || num_code == 0 || position >= num_code {
             return None;
         }
+        // The set's last data index must fit the slot, as agave checks it.
+        let fec_set_index = u32_at(b, base + 15);
+        if fec_set_index.checked_add(u32::from(num_data) - 1)? >= MAX_SHREDS_PER_SLOT {
+            return None;
+        }
         Kind::Code { num_data, num_code, position }
     };
+    let (index, fec_set_index) = (u32_at(b, base + 9), u32_at(b, base + 15));
+    // A data shred sits in its set, at or after the set's first index.
+    if index >= MAX_SHREDS_PER_SLOT || (is_data && fec_set_index > index) {
+        return None;
+    }
     Some(Header {
         slot: u64::from_le_bytes(b[base + 1..base + 9].try_into().unwrap()),
-        index: u32_at(b, base + 9),
-        fec_set_index: u32_at(b, base + 15),
+        index,
+        fec_set_index,
         proof_size,
         resigned,
         kind,
