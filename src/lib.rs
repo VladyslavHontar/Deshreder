@@ -6,8 +6,10 @@
 //!                              ──▶ Event::SlotComplete
 //! ```
 //!
-//! It also reports what it lacks — `received`, `last_index`, `missing` — so
-//! a repair driver can decide what to fetch. It never fetches anything itself:
+//! It also reports what it lacks — `received`, `last_index`, `missing`, and
+//! `needed`, only as many of a FEC set's missing shreds as its recovery still
+//! lacks — so a repair driver can decide what to fetch. A FEC set is one
+//! Merkle root: shreds of it under another root are dropped (`conflicts`). It never fetches anything itself:
 //! peers, requests, timeouts and retries live with the caller. Assembles;
 //! reports gaps; does not fill them.
 //!
