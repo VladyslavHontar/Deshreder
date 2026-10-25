@@ -23,6 +23,7 @@ use solana_entry::block_component::{
 };
 use solana_entry::entry::Entry;
 use solana_hash::Hash;
+use solana_transaction::versioned::VersionedTransaction;
 use std::collections::BTreeMap;
 
 /// What falls out of [`Assembler::push`].
@@ -33,7 +34,17 @@ pub enum Event {
     /// Like everything read off shreds they are what the leader sent, before
     /// any node ran it: the block may yet be skipped, and `Equivocated` takes
     /// back a slot's whole stream.
-    Entries { slot: u64, entries: Vec<Entry> },
+    /// `announced` is how many transactions at the front of the first entry
+    /// already went out in `Transactions`, read before the entry was whole.
+    Entries { slot: u64, entries: Vec<Entry>, announced: usize },
+    /// Transactions of an entry not yet whole, in order, each as soon as its
+    /// bytes are in: an entry's first transactions need not wait for its
+    /// last. The entry itself follows in `Entries`, its `announced` saying
+    /// how many of its transactions went out here.
+    Transactions { slot: u64, transactions: Vec<VersionedTransaction> },
+    /// A batch went out whole: everything in it is emitted. What streamed
+    /// earlier did so ahead of this moment.
+    BatchEnd { slot: u64 },
     /// The block footer marker (Alpenglow). Carries what a consumer used to
     /// wait for votes to learn: the bank hash and the producer's clock.
     Footer { slot: u64, bank_hash: Hash, producer_time_nanos: u64 },
@@ -102,6 +113,10 @@ struct Early {
     offset: usize,
     /// Entries emitted.
     emitted: usize,
+    /// Of the entry at `offset`, not yet whole: where its next transaction
+    /// begins, and how many of its transactions went out.
+    tx_offset: usize,
+    announced: usize,
 }
 
 #[derive(Default)]
@@ -385,13 +400,13 @@ fn stream(state: &mut SlotState, slot: u64, out: &mut Vec<Event>) -> usize {
             })
             .collect();
 
-        let early = state.early.take().filter(|e| e.start == start).map_or(0, |e| e.emitted);
+        let (early, announced) = state.early.take().filter(|e| e.start == start).map_or((0, 0), |e| (e.emitted, e.announced));
         match wincode::deserialize::<BlockComponent>(&blob) {
             Ok(BlockComponent::EntryBatch(mut entries)) => {
                 // Those read from the batch's start before it was whole went out then.
                 entries.drain(..early.min(entries.len()));
                 if !entries.is_empty() {
-                    out.push(Event::Entries { slot, entries });
+                    out.push(Event::Entries { slot, entries, announced });
                 }
             }
             Ok(BlockComponent::BlockMarker(VersionedBlockMarker::V1(BlockMarkerV1::BlockFooter(f)))) => {
@@ -406,6 +421,7 @@ fn stream(state: &mut SlotState, slot: u64, out: &mut Vec<Event>) -> usize {
             Err(_) => out.push(Event::UndecodableBatch { slot, first_index: start, last_index: end }),
         }
 
+        out.push(Event::BatchEnd { slot });
         let last = state.data[&end].header.last_in_slot();
         // Emitted batches are never read again; drop them so a slow slot
         // does not hold every shred until completion.
@@ -426,7 +442,7 @@ fn stream(state: &mut SlotState, slot: u64, out: &mut Vec<Event>) -> usize {
 /// transactions need not wait for its last shreds. A block marker waits for
 /// its whole batch, and bytes that do not read as a whole entry wait for more.
 fn read_early(state: &mut SlotState, slot: u64, start: u32, upto: u32, out: &mut Vec<Event>) -> usize {
-    let fresh = || Early { start, upto: start, blob: Vec::new(), offset: ENTRY_COUNT, emitted: 0 };
+    let fresh = || Early { start, upto: start, blob: Vec::new(), offset: ENTRY_COUNT, emitted: 0, tx_offset: 0, announced: 0 };
     let early = state.early.get_or_insert_with(fresh);
     if early.start != start {
         *early = fresh();
@@ -460,14 +476,39 @@ fn read_early(state: &mut SlotState, slot: u64, start: u32, upto: u32, out: &mut
             }
         }
     }
-    early.offset = early.blob.len() - rest.len();
-    early.emitted += entries.len();
     let emitted = entries.len();
     if !entries.is_empty() {
-        out.push(Event::Entries { slot, entries });
+        out.push(Event::Entries { slot, entries, announced: early.announced });
+        (early.tx_offset, early.announced) = (0, 0);
+    }
+    early.offset = early.blob.len() - rest.len();
+    early.emitted += emitted;
+    // The entry that is not whole yet: its transactions, one by one, past its
+    // header (`num_hashes`, `hash`, and how many transactions follow).
+    if (early.emitted as u64) < count && rest.len() >= ENTRY_HEADER {
+        let txs = u64::from_le_bytes(rest[ENTRY_HEADER - 8..ENTRY_HEADER].try_into().expect("8 bytes"));
+        if early.tx_offset == 0 {
+            early.tx_offset = early.offset + ENTRY_HEADER;
+        }
+        let mut at = &early.blob[early.tx_offset..];
+        let mut transactions = Vec::new();
+        while ((early.announced + transactions.len()) as u64) < txs {
+            match wincode::deserialize_from::<VersionedTransaction>(&mut at) {
+                Ok(tx) => transactions.push(tx),
+                Err(_) => break, // the rest of it is in shreds still to come
+            }
+            early.tx_offset = early.blob.len() - at.len();
+        }
+        early.announced += transactions.len();
+        if !transactions.is_empty() {
+            out.push(Event::Transactions { slot, transactions });
+        }
     }
     emitted
 }
+
+/// Bytes of an entry ahead of its transactions: `num_hashes`, `hash`, and their count.
+const ENTRY_HEADER: usize = 8 + 32 + 8;
 
 /// Bytes of an entry batch's leading count of entries.
 const ENTRY_COUNT: usize = 8;
@@ -606,6 +647,7 @@ mod tests {
         let ev = feed(&mut Assembler::new(), data);
         assert_eq!(ev, vec![
             Event::Footer { slot: 800, bank_hash: footer.bank_hash, producer_time_nanos: footer.block_producer_time_nanos },
+            Event::BatchEnd { slot: 800 },
             Event::SlotComplete { slot: 800 },
         ]);
     }
@@ -767,6 +809,45 @@ mod tests {
         assert!(!early.is_empty(), "the run from the start is read at once");
         let rest = collected(&feed(&mut a, [data[data.len() - 1].clone()]));
         assert_eq!([early, rest].concat(), want);
+    }
+
+    #[test]
+    fn transactions_go_out_one_by_one_ahead_of_their_entry() {
+        // Few entries, each of many transactions: an entry spans several shreds.
+        let tx = |k: u32| VersionedTransaction {
+            signatures: vec![solana_signature::Signature::from([(k % 251) as u8; 64]); 1 + (k % 3) as usize],
+            ..VersionedTransaction::default()
+        };
+        let want: Vec<Entry> = (0..4u32)
+            .map(|e| Entry { num_hashes: e.into(), hash: Hash::default(), transactions: (0..200).map(|k| tx(e * 1000 + k)).collect() })
+            .collect();
+        let all: Vec<VersionedTransaction> = want.iter().flat_map(|e| e.transactions.clone()).collect();
+        let (data, _) = shred_component(2100, &BlockComponent::EntryBatch(want.clone()), true, 0);
+        assert!(data.len() > 8, "an entry over several shreds: {} shreds", data.len());
+
+        let mut a = Assembler::new();
+        let (mut streamed, mut ahead, mut entries) = (Vec::new(), 0, Vec::new());
+        for shred in &data {
+            for ev in feed(&mut a, [shred.clone()]) {
+                match ev {
+                    Event::Transactions { transactions, .. } => {
+                        ahead += transactions.len();
+                        streamed.extend(transactions);
+                    }
+                    Event::Entries { entries: got, announced, .. } => {
+                        // What was announced is not given twice.
+                        for (k, e) in got.iter().enumerate() {
+                            streamed.extend(e.transactions.iter().skip(if k == 0 { announced } else { 0 }).cloned());
+                        }
+                        entries.extend(got);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(ahead > 0, "some went out before their entry was whole");
+        assert_eq!(streamed, all, "every transaction once, in order");
+        assert_eq!(entries, want, "the entries themselves whole");
     }
 
     #[test]

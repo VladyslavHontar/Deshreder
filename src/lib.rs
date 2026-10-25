@@ -4,6 +4,9 @@
 //! packet ──▶ Deshredder::push ──▶ Event::Entries      (whole entries as soon as the shreds
 //!                                                      from their batch's start are in;
 //!                                                      the rest when the batch is whole)
+//!                              ──▶ Event::Transactions (those of an entry not yet whole, one
+//!                                                      by one as their bytes come)
+//!                              ──▶ Event::BatchEnd     (a batch went out whole)
 //!                              ──▶ Event::Footer       (bank hash + producer clock)
 //!                              ──▶ Event::SlotComplete
 //! ```
@@ -29,3 +32,4 @@ pub use assembler::{Assembler as Deshredder, Event};
 pub use wire::merkle_root;
 pub use solana_entry::entry::Entry;
 pub use solana_hash::Hash;
+pub use solana_transaction::versioned::VersionedTransaction;
