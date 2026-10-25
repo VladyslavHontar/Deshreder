@@ -15,6 +15,9 @@ path = "src/lib.rs"
 # solana-ledger and the rocksdb it drags in are dev-only.
 solana-entry = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0", features = ["agave-unstable-api"] }
 solana-hash  = "=4.6.0"
+# The transaction type of an entry, to read transactions one by one ahead of
+# their entry; the version solana-entry resolves.
+solana-transaction = { version = "=4.3.0", features = ["wincode"] }
 wincode      = "0.6.1"
 # Rebuilds lost data shreds from coding shreds. Same crate agave shreds with,
 # so the GF(2^8) field and shard order match by construction. Default features

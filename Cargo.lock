@@ -1701,6 +1701,7 @@ dependencies = [
  "solana-keypair",
  "solana-ledger",
  "solana-signature",
+ "solana-transaction",
  "wincode",
 ]
 
