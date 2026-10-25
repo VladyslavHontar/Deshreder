@@ -28,7 +28,11 @@ use std::collections::BTreeMap;
 /// What falls out of [`Assembler::push`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// One entry batch, emitted as soon as its shreds were all present.
+    /// Entries of one batch, in order: those whole in the shreds from the
+    /// batch's start as soon as those are in, the rest when the batch is.
+    /// Like everything read off shreds they are what the leader sent, before
+    /// any node ran it: the block may yet be skipped, and `Equivocated` takes
+    /// back a slot's whole stream.
     Entries { slot: u64, entries: Vec<Entry> },
     /// The block footer marker (Alpenglow). Carries what a consumer used to
     /// wait for votes to learn: the bank hash and the producer's clock.
@@ -38,12 +42,14 @@ pub enum Event {
     SlotComplete { slot: u64 },
     /// A complete run of shreds did not decode as a `BlockComponent`. It is
     /// skipped so the slot cannot stall forever; the consumer decides what a
-    /// hole means. This should never fire on honest leader output.
+    /// hole means. Entries read whole from its start may already have gone
+    /// out. This should never fire on honest leader output.
     UndecodableBatch { slot: u64, first_index: u32, last_index: u32 },
     /// The slot's shreds contradict one another: its leader signed two
     /// versions of the block. Which one is the block cannot be told from the
     /// shreds, so neither is assembled: the slot's state is dropped and its
-    /// later packets are ignored. Emitted once per slot.
+    /// later packets are ignored. Emitted once per slot; whatever of the slot
+    /// went out before, early entries included, is to be taken back.
     Equivocated { slot: u64 },
 }
 
@@ -80,6 +86,22 @@ struct SlotState {
     last_index: Option<u32>,
     /// The slot this block builds on (`slot − parent_offset`), from the first data shred.
     parent: Option<u64>,
+    /// How far the batch at `next` was read before its last shreds came.
+    early: Option<Early>,
+}
+
+/// Entries already emitted from the start of an unfinished batch.
+struct Early {
+    /// The batch's first index.
+    start: u32,
+    /// The first index past the shreds held in a row when it was last read.
+    upto: u32,
+    /// The bytes of the shreds `start..upto`, each shred's added once.
+    blob: Vec<u8>,
+    /// Bytes of the batch read: its entry count, then whole entries.
+    offset: usize,
+    /// Entries emitted.
+    emitted: usize,
 }
 
 #[derive(Default)]
@@ -88,6 +110,8 @@ pub struct Assembler {
     /// Slots whose LAST_SHRED_IN_SLOT batch was emitted, with their parent.
     /// A late duplicate must not resurrect them; pruned by `evict_below`.
     finished: BTreeMap<u64, Option<u64>>,
+    /// Entries emitted before their batch was whole.
+    early_entries: u64,
     /// Slots found to hold two versions of their block; pruned by `evict_below`.
     equivocated: std::collections::BTreeSet<u64>,
     /// Everything below is history: dropped on sight.
@@ -157,7 +181,7 @@ impl Assembler {
             }
         }
         recover(state, h.slot, h.fec_set_index);
-        stream(state, h.slot, out);
+        self.early_entries += stream(state, h.slot, out) as u64;
         if self.slots[&h.slot].next == u32::MAX {
             let done = self.slots.remove(&h.slot).expect("slot state");
             self.finished.insert(h.slot, done.parent);
@@ -177,6 +201,11 @@ impl Assembler {
 
     pub fn active_slots(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Entries emitted before the batch they are in was whole.
+    pub fn early_entries(&self) -> u64 {
+        self.early_entries
     }
 
     /// Shreds that contradicted their slot's others, each giving the slot up
@@ -335,14 +364,15 @@ fn recover(state: &mut SlotState, slot: u64, fec_set_index: u32) {
 }
 
 /// Emit every batch whose shreds are now all present, in order.
-fn stream(state: &mut SlotState, slot: u64, out: &mut Vec<Event>) {
+/// Returns how many entries went out before their batch was whole.
+fn stream(state: &mut SlotState, slot: u64, out: &mut Vec<Event>) -> usize {
     loop {
         let start = state.next;
         // Walk the contiguous run from `start` to the first DATA_COMPLETE.
         let mut end = start;
         let end = loop {
             match state.data.get(&end) {
-                None => return,
+                None => return read_early(state, slot, start, end, out),
                 Some(d) if d.header.data_complete() => break end,
                 Some(_) => end += 1,
             }
@@ -355,8 +385,15 @@ fn stream(state: &mut SlotState, slot: u64, out: &mut Vec<Event>) {
             })
             .collect();
 
+        let early = state.early.take().filter(|e| e.start == start).map_or(0, |e| e.emitted);
         match wincode::deserialize::<BlockComponent>(&blob) {
-            Ok(BlockComponent::EntryBatch(entries)) => out.push(Event::Entries { slot, entries }),
+            Ok(BlockComponent::EntryBatch(mut entries)) => {
+                // Those read from the batch's start before it was whole went out then.
+                entries.drain(..early.min(entries.len()));
+                if !entries.is_empty() {
+                    out.push(Event::Entries { slot, entries });
+                }
+            }
             Ok(BlockComponent::BlockMarker(VersionedBlockMarker::V1(BlockMarkerV1::BlockFooter(f)))) => {
                 let VersionedBlockFooter::V1(footer) = f.inner();
                 out.push(Event::Footer {
@@ -379,10 +416,61 @@ fn stream(state: &mut SlotState, slot: u64, out: &mut Vec<Event>) {
         if last {
             out.push(Event::SlotComplete { slot });
             state.next = u32::MAX; // sentinel: slot is done
-            return;
+            return 0;
         }
     }
 }
+
+/// Emit the entries whole in the shreds held in a row from `start` up to
+/// `upto`, the first one missing, that were not emitted yet: a batch's first
+/// transactions need not wait for its last shreds. A block marker waits for
+/// its whole batch, and bytes that do not read as a whole entry wait for more.
+fn read_early(state: &mut SlotState, slot: u64, start: u32, upto: u32, out: &mut Vec<Event>) -> usize {
+    let fresh = || Early { start, upto: start, blob: Vec::new(), offset: ENTRY_COUNT, emitted: 0 };
+    let early = state.early.get_or_insert_with(fresh);
+    if early.start != start {
+        *early = fresh();
+    }
+    if upto <= early.upto {
+        return 0; // no shred joined the run since it was last read
+    }
+    // Only the shreds that joined the run are copied: a long batch is not
+    // copied again for each of its shreds.
+    for i in early.upto..upto {
+        let d = &state.data[&i];
+        early.blob.extend_from_slice(wire::data_in_shard(&d.shard, &d.header));
+    }
+    early.upto = upto;
+    let blob = &early.blob;
+    let Some(count) = blob.get(..ENTRY_COUNT).map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes"))) else { return 0 };
+    // A block marker waits for its whole batch, and so does a count the whole
+    // batch's decoder would refuse (its length bound, `MaxDataShredsLen`).
+    if count == 0 || count > solana_entry::entry::MAX_DATA_SHREDS_SIZE as u64 {
+        return 0;
+    }
+    let mut rest = &blob[early.offset.min(blob.len())..];
+    let mut entries = Vec::new();
+    while ((early.emitted + entries.len()) as u64) < count {
+        let before = rest;
+        match wincode::deserialize_from::<Entry>(&mut rest) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => {
+                rest = before; // cut short: the rest of it is in shreds still to come
+                break;
+            }
+        }
+    }
+    early.offset = early.blob.len() - rest.len();
+    early.emitted += entries.len();
+    let emitted = entries.len();
+    if !entries.is_empty() {
+        out.push(Event::Entries { slot, entries });
+    }
+    emitted
+}
+
+/// Bytes of an entry batch's leading count of entries.
+const ENTRY_COUNT: usize = 8;
 
 #[cfg(test)]
 mod tests {
@@ -638,11 +726,47 @@ mod tests {
         let (data, code) = shred_component(1800, &BlockComponent::EntryBatch(entries(300)), true, 0);
         let (_, other_code) = shred_component(1800, &BlockComponent::EntryBatch(entries(301)), true, 3);
         let mut a = Assembler::new();
-        assert!(feed(&mut a, data[..10].iter().chain(&code[..1]).cloned()).is_empty());
+        feed(&mut a, data[..10].iter().chain(&code[..1]).cloned());
         assert_eq!(feed(&mut a, other_code[..1].iter().cloned()), vec![Event::Equivocated { slot: 1800 }]);
         // An honest slot next to it is untouched.
         let (next, _) = shred_component(1801, &BlockComponent::EntryBatch(entries(5)), true, 0);
         assert_eq!(collected(&feed(&mut a, next)), entries(5));
+    }
+
+    #[test]
+    fn a_batch_starts_streaming_before_its_last_shreds() {
+        let want = entries(300);
+        let (data, _) = shred_component(1900, &BlockComponent::EntryBatch(want.clone()), true, 0);
+        assert!(data.len() >= 6, "a batch over many shreds: {}", data.len());
+        let mut a = Assembler::new();
+        let mut early = Vec::new();
+        for (k, shred) in data[..data.len() - 1].iter().enumerate() {
+            let got = collected(&feed(&mut a, [shred.clone()]));
+            assert!(got.len() <= want.len());
+            if k > 0 {
+                assert!(!got.is_empty() || early.len() == want.len(), "shred {k} added entries");
+            }
+            early.extend(got);
+        }
+        assert!(!early.is_empty(), "entries out before the batch is whole");
+        assert_eq!(early, want[..early.len()], "in order, from the start");
+        let ev = feed(&mut a, [data[data.len() - 1].clone()]);
+        let rest = collected(&ev);
+        assert_eq!(a.early_entries() as usize, early.len());
+        assert_eq!([early, rest].concat(), want, "the rest once whole, nothing twice");
+        assert_eq!(ev.last(), Some(&Event::SlotComplete { slot: 1900 }));
+    }
+
+    #[test]
+    fn nothing_streams_before_a_batch_begins() {
+        let want = entries(300);
+        let (data, _) = shred_component(2000, &BlockComponent::EntryBatch(want.clone()), true, 0);
+        let mut a = Assembler::new();
+        assert!(collected(&feed(&mut a, data[1..data.len() - 1].iter().cloned())).is_empty(), "its first shred is missing");
+        let early = collected(&feed(&mut a, [data[0].clone()]));
+        assert!(!early.is_empty(), "the run from the start is read at once");
+        let rest = collected(&feed(&mut a, [data[data.len() - 1].clone()]));
+        assert_eq!([early, rest].concat(), want);
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! Pure Solana shred assembler: raw packets in, block components out.
 //!
 //! ```text
-//! packet ──▶ Deshredder::push ──▶ Event::Entries      (each batch, as soon as present)
+//! packet ──▶ Deshredder::push ──▶ Event::Entries      (whole entries as soon as the shreds
+//!                                                      from their batch's start are in;
+//!                                                      the rest when the batch is whole)
 //!                              ──▶ Event::Footer       (bank hash + producer clock)
 //!                              ──▶ Event::SlotComplete
 //! ```
