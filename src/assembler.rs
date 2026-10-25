@@ -1,6 +1,10 @@
 //! Raw shreds in, block components out.
 //!
 //! Per slot, data shreds are kept by index and coding shreds by FEC set. A
+//! FEC set is one Merkle tree, every shred of it signed by the leader through
+//! one root: the first root seen for a set is the set's, and a shred of the
+//! same set under another root is dropped, so two versions of a block from
+//! an equivocating leader never meet in one Reed–Solomon decode. A
 //! batch is a contiguous run of data shreds ending at DATA_COMPLETE; the
 //! moment such a run is present it is decoded as one `BlockComponent` and
 //! emitted — nothing waits for the rest of the slot. When a set has lost
@@ -44,9 +48,11 @@ struct DataShred {
 }
 
 struct FecSet {
-    num_data: u16,
-    num_code: u16,
-    shard_len: usize,
+    /// The Merkle root every shred of the set proves its place under.
+    root: [u8; 32],
+    /// `(num_data, num_code, shard_len)`, as its first coding shred says;
+    /// `None` until one arrives, and with it no recovery.
+    coding: Option<(u16, u16, usize)>,
     code: BTreeMap<u16, Vec<u8>>,
     recovered: bool,
 }
@@ -73,6 +79,8 @@ pub struct Assembler {
     finished: BTreeMap<u64, Option<u64>>,
     /// Everything below is history: dropped on sight.
     floor: u64,
+    /// Shreds dropped for proving a root other than their set's.
+    conflicts: u64,
 }
 
 impl Assembler {
@@ -86,7 +94,13 @@ impl Assembler {
         if h.slot < self.floor || self.finished.contains_key(&h.slot) {
             return;
         }
+        let Some(root) = wire::merkle_root(packet) else { return };
         let state = self.slots.entry(h.slot).or_default();
+        let set = state.fec.entry(h.fec_set_index).or_insert_with(|| FecSet { root, coding: None, code: BTreeMap::new(), recovered: false });
+        if set.root != root {
+            self.conflicts += 1;
+            return;
+        }
         let shard = wire::shard(packet, &h);
         match h.kind {
             Kind::Data { parent_offset, .. } => {
@@ -102,14 +116,8 @@ impl Assembler {
                 });
             }
             Kind::Code { num_data, num_code, position } => {
-                let set = state.fec.entry(h.fec_set_index).or_insert_with(|| FecSet {
-                    num_data,
-                    num_code,
-                    shard_len: h.shard_len(),
-                    code: BTreeMap::new(),
-                    recovered: false,
-                });
-                if set.shard_len == shard.len() && !set.recovered {
+                let (_, _, shard_len) = *set.coding.get_or_insert((num_data, num_code, h.shard_len()));
+                if shard_len == shard.len() && !set.recovered {
                     set.code.entry(position).or_insert_with(|| shard.to_vec());
                 }
             }
@@ -134,6 +142,12 @@ impl Assembler {
 
     pub fn active_slots(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Shreds dropped so far for proving another root than their set's: a
+    /// leader that sent two versions of a block, or a forger.
+    pub fn conflicts(&self) -> u64 {
+        self.conflicts
     }
 
     // ── what a repair driver needs to know, and nothing more ─────────────
@@ -182,17 +196,48 @@ impl Assembler {
             .take(limit)
             .collect()
     }
+
+    /// The data indices worth asking for to finish `slot`, in order, at most
+    /// `limit`: of a set whose size a coding shred told, only as many of its
+    /// missing ones as it still lacks for Reed–Solomon to rebuild the rest
+    /// (any shred of a set will do, so `num_data` held of either kind is
+    /// enough); of any other, every missing one.
+    pub fn needed(&self, slot: u64, limit: usize) -> Vec<u32> {
+        let Some(state) = self.slots.get(&slot) else { return Vec::new() };
+        let mut out = Vec::new();
+        // The set the last index fell in, and how many more of it to take.
+        let mut current: Option<(u32, usize)> = None;
+        for i in self.missing(slot, usize::MAX) {
+            let set = state.fec.range(..=i).next_back().and_then(|(&start, set)| {
+                let (num_data, _, _) = set.coding?;
+                (i < start + u32::from(num_data)).then_some((start, set, num_data))
+            });
+            let Some((start, set, num_data)) = set else {
+                out.push(i);
+                if out.len() == limit { break }
+                continue;
+            };
+            if current.is_none_or(|(s, _)| s != start) {
+                let held = state.data.range(start..start + u32::from(num_data)).count() + set.code.len();
+                current = Some((start, usize::from(num_data).saturating_sub(held)));
+            }
+            if let Some((_, left)) = current.as_mut().filter(|(_, left)| *left > 0) {
+                *left -= 1;
+                out.push(i);
+                if out.len() == limit { break }
+            }
+        }
+        out
+    }
 }
 
 /// Rebuild missing data shards of one FEC set once enough shards are held.
 fn recover(state: &mut SlotState, slot: u64, fec_set_index: u32) {
     let Some(set) = state.fec.get_mut(&fec_set_index) else { return };
-    if set.recovered {
-        return;
-    }
-    let num_data = usize::from(set.num_data);
-    let num_code = usize::from(set.num_code);
-    let range = fec_set_index..fec_set_index.saturating_add(set.num_data.into());
+    let Some((data_shreds, code_shreds, _)) = set.coding.filter(|_| !set.recovered) else { return };
+    let num_data = usize::from(data_shreds);
+    let num_code = usize::from(code_shreds);
+    let range = fec_set_index..fec_set_index.saturating_add(data_shreds.into());
     let present = state.data.range(range.clone()).count();
     if present == num_data {
         set.recovered = true;
@@ -207,7 +252,7 @@ fn recover(state: &mut SlotState, slot: u64, fec_set_index: u32) {
     for index in range.clone() {
         shards.push(state.data.get(&index).map(|d| d.shard.clone()));
     }
-    for position in 0..set.num_code {
+    for position in 0..code_shreds {
         shards.push(set.code.get(&position).cloned());
     }
     let Ok(rs) = ReedSolomon::new(num_data, num_code) else { return };
@@ -449,6 +494,41 @@ mod tests {
             let theirs = solana_ledger::shred::layout::get_merkle_root(packet).expect("agave root");
             assert_eq!(ours, theirs.to_bytes(), "index {}", s.index());
         }
+    }
+
+    #[test]
+    fn a_set_is_one_root_and_another_version_of_it_is_dropped() {
+        let (data, code) = shred_component(1300, &BlockComponent::EntryBatch(entries(40)), true, 0);
+        let roots: std::collections::BTreeSet<[u8; 32]> =
+            data.iter().chain(&code).map(|s| crate::wire::merkle_root(&s.payload().bytes).unwrap()).collect();
+        assert_eq!(roots.len(), 1, "data and coding shreds of a set prove one root");
+
+        // The same slot and indices, other entries: what an equivocating leader sends.
+        let (other, _) = shred_component(1300, &BlockComponent::EntryBatch(entries(41)), true, 0);
+        let mut a = Assembler::new();
+        feed(&mut a, [data[0].clone()]);
+        assert!(feed(&mut a, other).is_empty(), "nothing of the other version is taken");
+        assert!(a.conflicts() > 0);
+        let ev = feed(&mut a, data[1..].iter().cloned());
+        assert_eq!(collected(&ev), entries(40), "the first version assembles untouched");
+    }
+
+    #[test]
+    fn asks_only_what_a_set_still_lacks() {
+        let (data, code) = shred_component(1400, &BlockComponent::EntryBatch(entries(300)), true, 0);
+        assert!(data.len() >= 6 && code.len() >= 2, "one set with room to drop some");
+        let mut a = Assembler::new();
+        // The last data shred tells the length; the first five are lost.
+        feed(&mut a, data[5..].iter().cloned());
+        assert_eq!(a.needed(1400, 100), vec![0, 1, 2, 3, 4], "no coding shred yet: every one");
+        // Two coding shreds stand for two of them: three more rebuild the set.
+        feed(&mut a, code[..2].iter().cloned());
+        assert_eq!(a.needed(1400, 100), vec![0, 1, 2]);
+        assert_eq!(a.needed(1400, 2), vec![0, 1], "limit is honoured");
+        let ev = feed(&mut a, data[..3].iter().cloned());
+        assert!(a.is_complete(1400), "rebuilt with exactly what was asked for");
+        assert_eq!(collected(&ev), entries(300));
+        assert!(a.needed(1400, 100).is_empty());
     }
 
     #[test]

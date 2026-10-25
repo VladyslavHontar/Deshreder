@@ -13,7 +13,7 @@ path = "src/lib.rs"
 # `BlockComponent` / `Entry` and their wincode codec — the only agave crate the
 # library needs. The shred wire layout is parsed here (see src/wire.rs), so
 # solana-ledger and the rocksdb it drags in are dev-only.
-solana-entry = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0" }
+solana-entry = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0", features = ["agave-unstable-api"] }
 solana-hash  = "=4.6.0"
 wincode      = "0.6.1"
 # Rebuilds lost data shreds from coding shreds. Same crate agave shreds with,
