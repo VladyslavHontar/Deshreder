@@ -65,7 +65,25 @@ pub struct Header {
     pub kind: Kind,
 }
 
+/// What SIMD-0504 fixes in a Merkle FEC set: 32 data shreds and 32 coding.
+pub const SET_DATA: u32 = 32;
+pub const SET_CODE: u32 = 32;
+
 impl Header {
+    /// Whether the shred sits where SIMD-0504 puts it: a data shred in the 32
+    /// positions from its set's first index; a coding shred of a 32:32 set, at
+    /// its position, with the index that position gives. A set of another
+    /// shape, or a shred out of place, is no set of that block.
+    pub fn off_spec(&self) -> bool {
+        match self.kind {
+            Kind::Data { .. } => self.index - self.fec_set_index >= SET_DATA,
+            Kind::Code { num_data, num_code, position } => {
+                u32::from(num_data) != SET_DATA
+                    || u32::from(num_code) != SET_CODE
+                    || self.fec_set_index.checked_add(u32::from(position)) != Some(self.index)
+            }
+        }
+    }
     #[inline]
     pub fn is_data(&self) -> bool {
         matches!(self.kind, Kind::Data { .. })

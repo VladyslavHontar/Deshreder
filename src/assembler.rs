@@ -133,11 +133,30 @@ pub struct Assembler {
     floor: u64,
     /// Shreds dropped for proving a root other than their set's.
     conflicts: u64,
+    /// Shreds that sat off SIMD-0504's shape or named another parent than their slot's first.
+    off_spec: u64,
+    /// Drop such shreds instead of only counting them.
+    strict: bool,
 }
 
 impl Assembler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Drops the shreds that break SIMD-0504's rules (see `off_spec`) instead
+    /// of counting them and going on. Agave does not enforce the rules yet:
+    /// count first, to see whether the network already keeps them.
+    pub fn strict(mut self) -> Self {
+        self.strict = true;
+        self
+    }
+
+    /// Shreds seen off SIMD-0504's shape: a set that is not 32 data and 32
+    /// coding, a shred outside its set's positions, or a data shred naming
+    /// another parent than the slot's first did.
+    pub fn off_spec(&self) -> u64 {
+        self.off_spec
     }
 
     /// Feed one packet. Events, if any, are appended to `out`.
@@ -147,6 +166,17 @@ impl Assembler {
             return;
         }
         let Some(root) = wire::merkle_root(packet) else { return };
+        let parent = self.slots.get(&h.slot).and_then(|s| s.parent);
+        let other_parent = match h.kind {
+            Kind::Data { parent_offset, .. } => parent.is_some_and(|p| p != h.slot.saturating_sub(u64::from(parent_offset))),
+            Kind::Code { .. } => false,
+        };
+        if h.off_spec() || other_parent {
+            self.off_spec += 1;
+            if self.strict {
+                return;
+            }
+        }
         let state = self.slots.entry(h.slot).or_default();
         // What one honest block never holds, each a sign of a second version:
         // a set under two roots; a data shred naming another set than the
@@ -545,6 +575,26 @@ mod tests {
             Event::Entries { entries, .. } => Some(entries.clone()),
             _ => None,
         }).flatten().collect()
+    }
+
+    #[test]
+    fn real_shreds_keep_the_set_shape_and_strict_drops_what_breaks_it() {
+        let (data, code) = shred_component(600, &BlockComponent::EntryBatch(entries(100)), true, 0);
+        let mut plain = Assembler::new();
+        feed(&mut plain, data.iter().chain(&code).cloned());
+        assert_eq!(plain.off_spec(), 0, "agave's own shreds are 32:32 and in place");
+        // A coding shred claiming another position than its index says is off.
+        let mut bad = code[0].payload().bytes.to_vec();
+        let at = 64 + 19 + 4; // coding header: num_data, num_code, position
+        bad[at] ^= 1;
+        let h = wire::parse_packet(&bad).expect("still parses");
+        assert!(h.off_spec());
+        let mut lax = Assembler::new();
+        lax.push(&bad, &mut Vec::new());
+        assert_eq!((lax.off_spec(), lax.active_slots()), (1, 1), "counted, and kept");
+        let mut strict = Assembler::new().strict();
+        strict.push(&bad, &mut Vec::new());
+        assert_eq!((strict.off_spec(), strict.active_slots()), (1, 0), "counted, and dropped before it opens a slot");
     }
 
     #[test]
