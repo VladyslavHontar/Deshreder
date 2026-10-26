@@ -133,11 +133,29 @@ pub struct Assembler {
     floor: u64,
     /// Shreds dropped for proving a root other than their set's.
     conflicts: u64,
+    /// Shreds that sat off SIMD-0504's shape.
+    off_spec: u64,
+    /// Drop such shreds instead of only counting them.
+    strict: bool,
 }
 
 impl Assembler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Drops the shreds that break SIMD-0504's rules (see `off_spec`) instead
+    /// of counting them and going on. Agave does not enforce the rules yet:
+    /// count first, to see whether the network already keeps them.
+    pub fn strict(mut self) -> Self {
+        self.strict = true;
+        self
+    }
+
+    /// Shreds seen off SIMD-0504's shape: a set that is not 32 data and 32
+    /// coding, or a shred outside its set's positions.
+    pub fn off_spec(&self) -> u64 {
+        self.off_spec
     }
 
     /// Feed one packet. Events, if any, are appended to `out`.
@@ -147,6 +165,12 @@ impl Assembler {
             return;
         }
         let Some(root) = wire::merkle_root(packet) else { return };
+        if h.off_spec() {
+            self.off_spec += 1;
+            if self.strict {
+                return;
+            }
+        }
         let state = self.slots.entry(h.slot).or_default();
         // What one honest block never holds, each a sign of a second version:
         // a set under two roots; a data shred naming another set than the
@@ -155,8 +179,10 @@ impl Assembler {
         // or a data shred there or past its end naming another set or it.
         let contradicts = state.fec.get(&h.fec_set_index).is_some_and(|set| set.root != root)
             || match h.kind {
-                Kind::Data { .. } => {
-                    covering(state, h.index).is_some_and(|start| start != h.fec_set_index)
+                Kind::Data { parent_offset, .. } => {
+                    // A leader that named two parents for one slot made two blocks of it.
+                    state.parent.is_some_and(|p| p != h.slot.saturating_sub(u64::from(parent_offset)))
+                        || covering(state, h.index).is_some_and(|start| start != h.fec_set_index)
                         || state.sized.get(&h.fec_set_index).is_some_and(|&n| h.index >= h.fec_set_index.saturating_add(n.into()))
                 }
                 Kind::Code { num_data, .. } => match state.sized.get(&h.fec_set_index) {
@@ -545,6 +571,36 @@ mod tests {
             Event::Entries { entries, .. } => Some(entries.clone()),
             _ => None,
         }).flatten().collect()
+    }
+
+    #[test]
+    fn real_shreds_keep_the_set_shape_and_strict_drops_what_breaks_it() {
+        let (data, code) = shred_component(600, &BlockComponent::EntryBatch(entries(4000)), true, 0);
+        let mut plain = Assembler::new();
+        feed(&mut plain, data.iter().chain(&code).cloned());
+        assert_eq!(plain.off_spec(), 0, "agave's own shreds are 32:32 and in place");
+        // Two parents for one slot: a second version, whatever the mode.
+        let mut ev = Vec::new();
+        let mut two = Assembler::new().strict();
+        two.push(&data[0].payload().bytes, &mut ev);
+        // From another set, so that no root of its own contradicts it.
+        let later = data.iter().find(|s| s.fec_set_index() != data[0].fec_set_index()).expect("a second set");
+        let mut other = later.payload().bytes.to_vec();
+        other[64 + 19] ^= 1; // parent_offset, first byte of the data header
+        two.push(&other, &mut ev);
+        assert!(ev.contains(&Event::Equivocated { slot: 600 }), "{ev:?}");
+        // A coding shred claiming another position than its index says is off.
+        let mut bad = code[0].payload().bytes.to_vec();
+        let at = 64 + 19 + 4; // coding header: num_data, num_code, position
+        bad[at] ^= 1;
+        let h = wire::parse_packet(&bad).expect("still parses");
+        assert!(h.off_spec());
+        let mut lax = Assembler::new();
+        lax.push(&bad, &mut Vec::new());
+        assert_eq!((lax.off_spec(), lax.active_slots()), (1, 1), "counted, and kept");
+        let mut strict = Assembler::new().strict();
+        strict.push(&bad, &mut Vec::new());
+        assert_eq!((strict.off_spec(), strict.active_slots()), (1, 0), "counted, and dropped before it opens a slot");
     }
 
     #[test]

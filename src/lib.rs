@@ -16,7 +16,9 @@
 //! lacks — so a repair driver can decide what to fetch. A FEC set is one
 //! Merkle root and the sets of a block tile it: a slot whose shreds
 //! contradict that holds two versions of its block, and is given up whole
-//! (`Event::Equivocated`). It never fetches anything itself:
+//! (`Event::Equivocated`). Shreds off SIMD-0504's shape (32 data and 32 coding
+//! to a set, each in its place) are counted (`off_spec`) and, with `strict()`,
+//! dropped; agave does not enforce the rules yet. It never fetches anything itself:
 //! peers, requests, timeouts and retries live with the caller. Assembles;
 //! reports gaps; does not fill them.
 //!
