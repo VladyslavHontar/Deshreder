@@ -26,6 +26,10 @@ reed-solomon-erasure = "6.0.0"
 sha2                 = "0.10"
 
 [dev-dependencies]
+# Unlock `BlockFinalizationCert::new_for_tests()` for the footer-cert test. The
+# feature is empty (no extra deps); it unifies with the main solana-entry dep in
+# the test build only.
+solana-entry     = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0", features = ["dev-context-only-utils"] }
 # Real Merkle shreds for the tests come from agave's own Shredder.
 solana-ledger    = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0", features = ["agave-unstable-api"] }
 # Exact pins matching the agave v4.3.0 workspace, so cargo does not resolve a
