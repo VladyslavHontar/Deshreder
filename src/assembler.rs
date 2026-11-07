@@ -46,8 +46,22 @@ pub enum Event {
     /// earlier did so ahead of this moment.
     BatchEnd { slot: u64 },
     /// The block footer marker (Alpenglow). Carries what a consumer used to
-    /// wait for votes to learn: the bank hash and the producer's clock.
-    Footer { slot: u64, bank_hash: Hash, producer_time_nanos: u64 },
+    /// wait for votes to learn: the bank hash and the producer's clock, plus
+    /// the three vote-reward certificates the footer may carry. Each cert is
+    /// held as agave's own wincode schema encoding, byte-for-byte identical to
+    /// the on-wire footer bytes (`None` when the footer omitted it). The cert
+    /// schemas are canonical, so re-encoding the decoded cert reproduces the
+    /// exact wire bytes; Lumen folds those bytes into the bank hash, so a single
+    /// differing byte breaks bank-hash parity. A downstream decodes them with
+    /// the identical on-chain codec (`wincode::deserialize`).
+    Footer {
+        slot: u64,
+        bank_hash: Hash,
+        producer_time_nanos: u64,
+        block_final_cert: Option<Vec<u8>>,
+        skip_reward_cert: Option<Vec<u8>>,
+        notar_reward_cert: Option<Vec<u8>>,
+    },
     /// The LAST_SHRED_IN_SLOT batch was processed; every batch of this slot
     /// has been emitted and its state dropped. Later packets are ignored.
     SlotComplete { slot: u64 },
@@ -437,11 +451,33 @@ fn stream(state: &mut SlotState, slot: u64, out: &mut Vec<Event>) -> usize {
             }
             Ok(BlockComponent::BlockMarker(VersionedBlockMarker::V1(BlockMarkerV1::BlockFooter(f)))) => {
                 let VersionedBlockFooter::V1(footer) = f.inner();
-                out.push(Event::Footer {
-                    slot,
-                    bank_hash: footer.bank_hash,
-                    producer_time_nanos: footer.block_producer_time_nanos,
-                });
+                // Re-encode each present cert with agave's own schema codec, the
+                // one it was just decoded with. The cert schemas are canonical
+                // (fixed-width PODs; `FixIntLen` prefixes; `ShortU16` prefixes
+                // that reject non-canonical input at decode), so this reproduces
+                // the EXACT on-wire bytes byte-for-byte — which Lumen must fold
+                // to match the footer bank hash; a differing byte breaks parity.
+                // A serialize error is unreachable for a just-decoded cert, but
+                // if one ever occurred it is surfaced as UndecodableBatch, never
+                // dropped silently: a missing cert diverges the bank hash.
+                let enc = (
+                    footer.block_final_cert.as_ref().map(|c| wincode::serialize(c)).transpose(),
+                    footer.skip_reward_cert.as_ref().map(|c| wincode::serialize(c)).transpose(),
+                    footer.notar_reward_cert.as_ref().map(|c| wincode::serialize(c)).transpose(),
+                );
+                match enc {
+                    (Ok(block_final_cert), Ok(skip_reward_cert), Ok(notar_reward_cert)) => {
+                        out.push(Event::Footer {
+                            slot,
+                            bank_hash: footer.bank_hash,
+                            producer_time_nanos: footer.block_producer_time_nanos,
+                            block_final_cert,
+                            skip_reward_cert,
+                            notar_reward_cert,
+                        });
+                    }
+                    _ => out.push(Event::UndecodableBatch { slot, first_index: start, last_index: end }),
+                }
             }
             Ok(BlockComponent::BlockMarker(_)) => {} // header / update-parent / genesis
             Err(_) => out.push(Event::UndecodableBatch { slot, first_index: start, last_index: end }),
@@ -542,7 +578,7 @@ const ENTRY_COUNT: usize = 8;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_entry::block_component::{BlockFooterV1, LengthPrefixed};
+    use solana_entry::block_component::{BlockFinalizationCert, BlockFooterV1, LengthPrefixed};
     use solana_keypair::Keypair;
     use solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder};
 
@@ -702,10 +738,49 @@ mod tests {
         let (data, _) = shred_component(800, &BlockComponent::BlockMarker(marker), true, 0);
         let ev = feed(&mut Assembler::new(), data);
         assert_eq!(ev, vec![
-            Event::Footer { slot: 800, bank_hash: footer.bank_hash, producer_time_nanos: footer.block_producer_time_nanos },
+            Event::Footer {
+                slot: 800,
+                bank_hash: footer.bank_hash,
+                producer_time_nanos: footer.block_producer_time_nanos,
+                block_final_cert: None,
+                skip_reward_cert: None,
+                notar_reward_cert: None,
+            },
             Event::BatchEnd { slot: 800 },
             Event::SlotComplete { slot: 800 },
         ]);
+    }
+
+    #[test]
+    fn footer_carries_certs_byte_identical_to_wire() {
+        let cert = BlockFinalizationCert::new_for_tests();
+        let footer = BlockFooterV1 {
+            bank_hash: Hash::new_unique(),
+            block_producer_time_nanos: 1_726_000_000_123_456_789,
+            block_user_agent: b"agave".to_vec(),
+            block_final_cert: Some(cert.clone()),
+            skip_reward_cert: None,
+            notar_reward_cert: None,
+        };
+        let marker = VersionedBlockMarker::V1(BlockMarkerV1::BlockFooter(
+            LengthPrefixed::new(VersionedBlockFooter::V1(footer.clone()))));
+        let (data, _) = shred_component(900, &BlockComponent::BlockMarker(marker), true, 0);
+        let ev = feed(&mut Assembler::new(), data);
+
+        let Event::Footer { block_final_cert: Some(carried), skip_reward_cert: None, notar_reward_cert: None, slot: 900, .. } = &ev[0]
+        else { panic!("expected a Footer carrying only block_final_cert, got {:?}", ev[0]) };
+
+        // Byte-identity against the ORIGINAL wire bytes: the carried cert must be
+        // a verbatim contiguous slice of the footer as it is serialized on the
+        // wire — not merely a value that re-decodes equal. Lumen folds these
+        // exact bytes into the bank hash, so this is the property that matters.
+        let footer_wire = wincode::serialize(&footer).unwrap();
+        assert!(
+            footer_wire.windows(carried.len()).any(|w| w == carried.as_slice()),
+            "carried cert bytes are not a verbatim slice of the on-wire footer",
+        );
+        // And they still decode back to the identical cert with agave's codec.
+        assert_eq!(wincode::deserialize::<BlockFinalizationCert>(carried).unwrap(), cert);
     }
 
     #[test]
